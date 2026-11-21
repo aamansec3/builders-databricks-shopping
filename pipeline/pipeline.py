@@ -41,6 +41,10 @@ def log(msg):
     print(f"[{time.time() - T0:6.2f}s] {msg}", file=sys.stderr, flush=True)
 
 
+try:
+    os.makedirs(os.path.join(SCRATCH, "duckdb_tmp"), exist_ok=True)
+except OSError:
+    pass  # local runs without /scratch; DuckDB only needs it when it spills
 con = duckdb.connect()
 con.execute(f"SET threads = {NCPU}")
 con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.75))}GB'")
@@ -83,13 +87,13 @@ CREATE MACRO ts_iso(s) AS (
 );
 CREATE MACRO parse_ts(s) AS (
     CASE
+    WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])') THEN
+        CASE WHEN length(s) = 20 THEN ts_iso(s)
+             ELSE ts_iso(s) - (CASE WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END)
+                  * (try_cast(substr(s, 21, 2) AS BIGINT) * 3600000 + try_cast(substr(s, 24, 2) AS BIGINT) * 60000)
+        END
     WHEN regexp_full_match(s, '[0-9]+') THEN
         CASE WHEN length(ltrim(s, '0')) <= 18 THEN try_cast(s AS BIGINT) END
-    WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z') THEN
-        ts_iso(s)
-    WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][+-](?:[01][0-9]|2[0-3]):[0-5][0-9]') THEN
-        ts_iso(s) - (CASE WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END)
-                    * (try_cast(substr(s, 21, 2) AS BIGINT) * 3600000 + try_cast(substr(s, 24, 2) AS BIGINT) * 60000)
     END
 );
 CREATE MACRO ms_to_day(ms) AS (DATE '1970-01-01' + (ms // 86400000)::INTEGER);
@@ -128,17 +132,13 @@ def fields_relation(kind, n):
     """Well-formed lines of `kind`, split into list f of n fields, quotes stripped.
 
     A line is well-formed when it has exactly n fields and every quote wraps a
-    whole field. Lines without a quote only need the right comma count, which
-    is much cheaper than the regex.
+    whole field. One RE2 match checks both, and beats counting commas in SQL.
     """
     pattern = FIELD + ("," + FIELD) * (n - 1)
     return f"""(
         SELECT string_split(replace(line, '"', ''), ',') AS f
         FROM {lines_relation(kind)}
-        WHERE line IS NOT NULL AND CASE
-            WHEN contains(line, '"') THEN regexp_full_match(line, '{pattern}')
-            ELSE length(line) - length(replace(line, ',', '')) = {n - 1}
-        END
+        WHERE regexp_full_match(line, '{pattern}')
     )"""
 
 
@@ -180,43 +180,37 @@ SELECT c.id, n.person FROM c JOIN (SELECT comp, min(id) AS person FROM c GROUP B
 con.unregister("comp_arrow")
 
 # --- Events ---------------------------------------------------------------
-# Dedup keeps the copy with the smallest ingest_ts. ingest_ts is always valid
-# F1, whose string order is its time order, so we compare the strings.
-
-sql(f"""
-CREATE TABLE ev_raw AS
-SELECT f[1] AS event_id, f[2] AS user_id, f[3] AS ts, f[4] AS ingest_ts,
-       f[5] AS event_type, f[6] AS product_id, f[7] AS price
-FROM {fields_relation("events", 7)}
-WHERE f[1] <> ''
-""", "events parsed")
+# One streaming pass: parse each copy into typed values plus an `ok` flag for
+# the field rules, then keep the copy with the smallest ingest_ts per event_id.
+# Judging every copy before dedup is the same as judging only the kept copy,
+# because the flag travels with the copy it belongs to.
 
 sql(f"""
 CREATE TABLE ev AS
-WITH kept AS (
-    SELECT arg_min(struct_pack(user_id, ts, ingest_ts, event_type, product_id, price), ingest_ts) AS e
-    FROM ev_raw GROUP BY event_id
-), typed AS (
-    SELECT e.user_id, parse_ts(e.ts) AS ts, ts_iso(e.ingest_ts) AS ingest_ms,
-           e.event_type, e.product_id, e.price
-    FROM kept
+WITH parsed AS (
+    SELECT f[1] AS event_id, f[2] AS user_id, f[6] AS product_id,
+           parse_ts(f[3]) AS ts, ts_iso(f[4]) AS ingest_ms,
+           f[5] = 'purchase' AS is_purchase,
+           CASE WHEN f[5] = 'purchase' AND regexp_full_match(f[7], '[0-9]+') AND length(ltrim(f[7], '0')) <= 8
+                THEN try_cast(f[7] AS INTEGER) END AS price,
+           f[5] IN ('view', 'cart', 'purchase') AND f[2] <> '' AND f[6] <> '' AS ok
+    FROM {fields_relation("events", 7)}
+    WHERE f[1] <> ''
+), kept AS (
+    SELECT arg_min(struct_pack(user_id, product_id, ts, ingest_ms, is_purchase, price, ok), ingest_ms) AS e
+    FROM parsed GROUP BY event_id
 )
-SELECT coalesce(m.person, t.user_id) AS person, t.ts, t.event_type AS et,
+SELECT coalesce(m.person, k.e.user_id) AS person, k.e.ts AS ts, k.e.is_purchase AS is_purchase,
        coalesce(p.category, 'unknown') AS category,
-       CASE WHEN t.event_type = 'purchase' THEN try_cast(t.price AS BIGINT) ELSE 0 END AS price
-FROM typed t
-LEFT JOIN idmap m ON t.user_id = m.id
-LEFT JOIN products p ON t.product_id = p.product_id
-WHERE t.user_id <> ''
-  AND t.ts >= {WS} AND t.ts < {WE}
-  AND t.event_type IN ('view', 'cart', 'purchase')
-  AND t.product_id <> ''
-  AND (t.event_type <> 'purchase' OR (
-        regexp_full_match(t.price, '[0-9]+') AND length(ltrim(t.price, '0')) <= 8
-        AND try_cast(t.price AS BIGINT) BETWEEN 1 AND 10000000))
-  AND t.ingest_ms - t.ts <= {DAY}
-""", "events deduped + validated")
-sql("DROP TABLE ev_raw")
+       CASE WHEN k.e.is_purchase THEN k.e.price ELSE 0 END AS price
+FROM kept k
+LEFT JOIN idmap m ON k.e.user_id = m.id
+LEFT JOIN products p ON k.e.product_id = p.product_id
+WHERE k.e.ok
+  AND k.e.ts >= {WS} AND k.e.ts < {WE}
+  AND (NOT k.e.is_purchase OR k.e.price BETWEEN 1 AND 10000000)
+  AND k.e.ingest_ms - k.e.ts <= {DAY}
+""", "events parsed, deduped, validated")
 
 # --- Sessions -------------------------------------------------------------
 # A row starts a session when the gap to the previous row is over 30 min.
@@ -225,7 +219,7 @@ sql("DROP TABLE ev_raw")
 
 sql(f"""
 CREATE TABLE ev_s AS
-SELECT person, et, category, price,
+SELECT person, is_purchase, category, price,
        max(CASE WHEN prev IS NULL OR ts - prev > {GAP} THEN ts END)
            OVER (PARTITION BY person ORDER BY ts) AS start
 FROM (SELECT *, lag(ts) OVER (PARTITION BY person ORDER BY ts) AS prev FROM ev)
@@ -235,7 +229,7 @@ sql("DROP TABLE ev")
 sql("""
 CREATE TABLE sess AS
 SELECT person, start, ms_to_day(start) AS day,
-       count(*) AS n_events, sum(price) AS revenue, bool_or(et = 'purchase') AS has_purchase
+       count(*) AS n_events, sum(price) AS revenue, bool_or(is_purchase) AS has_purchase
 FROM ev_s GROUP BY person, start
 """, "sessions built")
 
@@ -328,7 +322,7 @@ COPY (
     WITH cat AS (
         SELECT s.person, s.day, e.category, sum(e.price) AS rev
         FROM ev_s e JOIN sess s ON e.person = s.person AND e.start = s.start
-        WHERE e.et = 'purchase' GROUP BY ALL
+        WHERE e.is_purchase GROUP BY ALL
     ), top AS (
         SELECT person, day, arg_max(category, rev) AS top_category FROM (
             SELECT * FROM cat QUALIFY row_number() OVER (PARTITION BY person, day ORDER BY rev DESC, category) = 1
