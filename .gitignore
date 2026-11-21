@@ -1,0 +1,6 @@
+.venv/
+dev/
+data-*/
+out/
+generator/target/
+__pycache__/
