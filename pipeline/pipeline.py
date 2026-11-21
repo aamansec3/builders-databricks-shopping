@@ -7,7 +7,7 @@ Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parque
 Temp   $SCRATCH_DIR (default /scratch)
 
 Stages, each a DuckDB table:
-  lines    raw text lines of every CSV (our own parser, not DuckDB's CSV dialect)
+  parse    Polars splits every CSV line into fields (our own dialect check)
   links -> idmap         union-find over linked IDs: user_id -> person
   events -> ev -> sess   dedup, validate, sessionize
   clicks -> clk          dedup, validate
@@ -15,21 +15,28 @@ Stages, each a DuckDB table:
 """
 import glob
 import json
+import mmap
 import os
 import sys
 import time
-
-import duckdb
-import numpy as np
-import pyarrow as pa
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
+from concurrent.futures import ThreadPoolExecutor
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
 SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
 NCPU = int(os.environ.get("NCPU", os.cpu_count() or 1))
 MEM_GB = int(os.environ.get("MEM_GB", "8"))
+
+# Polars sizes its pool from the host's CPU count, which in a container can be
+# far more than the 8 we get. It reads this variable once, at import.
+os.environ["POLARS_MAX_THREADS"] = str(NCPU)
+
+import duckdb  # noqa: E402
+import numpy as np  # noqa: E402
+import polars as pl  # noqa: E402
+import pyarrow as pa  # noqa: E402
+from scipy.sparse import coo_matrix  # noqa: E402
+from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 DAY = 86_400_000
 GAP = 1_800_000
@@ -47,7 +54,8 @@ except OSError:
     pass  # local runs without /scratch; DuckDB only needs it when it spills
 con = duckdb.connect()
 con.execute(f"SET threads = {NCPU}")
-con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.75))}GB'")
+# The parsed Polars frames live outside DuckDB's budget, so leave room for them.
+con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.6))}GB'")
 con.execute(f"SET temp_directory = '{os.path.join(SCRATCH, 'duckdb_tmp')}'")
 con.execute("SET preserve_insertion_order = false")
 con.execute("SET TimeZone = 'UTC'")
@@ -99,47 +107,51 @@ CREATE MACRO parse_ts(s) AS (
 CREATE MACRO ms_to_day(ms) AS (DATE '1970-01-01' + (ms // 86400000)::INTEGER);
 """)
 
-# --- Raw lines ------------------------------------------------------------
-# DuckDB's CSV reader treats \r as a line break, but the rules make \r data.
-# Files without \r (everything the generator writes) go through the fast
-# reader with a delimiter that never occurs, so each row is one whole line.
-# Files with \r are split on \n by hand.
-
-
-def lines_relation(kind):
-    files = sorted(glob.glob(os.path.join(DATA, kind, "*.csv")))
-    if not files:
-        return "(SELECT NULL::VARCHAR AS line WHERE false)"
-    flist = "[" + ",".join("'" + p.replace("'", "''") + "'" for p in files) + "]"
-    cr = {r[0] for r in con.execute(
-        f"SELECT filename FROM read_text({flist}) WHERE contains(content, chr(13))").fetchall()}
-    fast = [p for p in files if p not in cr]
-    parts = []
-    if fast:
-        fl = "[" + ",".join("'" + p.replace("'", "''") + "'" for p in fast) + "]"
-        parts.append(f"""SELECT line FROM read_csv({fl}, columns={{'line': 'VARCHAR'}}, delim='\\x01',
-            quote='', escape='', header=true, auto_detect=false, strict_mode=false)""")
-    if cr:
-        fl = "[" + ",".join("'" + p.replace("'", "''") + "'" for p in sorted(cr)) + "]"
-        parts.append(f"SELECT unnest(string_split(content, chr(10))[2:]) AS line FROM read_text({fl})")
-    return "(" + " UNION ALL ".join(parts) + ")"
-
+# --- Parsing --------------------------------------------------------------
+# Polars reads each file as whole lines (a separator and no quote char that
+# never occur), and its Rust string kernels validate and split them about
+# twice as fast as DuckDB's. It keeps a \r inside a line but strips one at the
+# end, so files containing any \r (never the generator's) are split on \n by
+# hand instead. A threaded mmap search finds them without copying the files.
 
 FIELD = r'(?:"[^",]*"|[^",]*)'
 
 
-def fields_relation(kind, n):
-    """Well-formed lines of `kind`, split into list f of n fields, quotes stripped.
+def has_cr(path):
+    if os.path.getsize(path) == 0:
+        return False
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        return m.find(b"\r") != -1
+
+
+def parse_fields(kind, n):
+    """Well-formed lines of `kind` as a Polars frame of n string columns f1..fn, quotes stripped.
 
     A line is well-formed when it has exactly n fields and every quote wraps a
-    whole field. One RE2 match checks both, and beats counting commas in SQL.
+    whole field; one regex checks both. Empty fields stay '', never null.
     """
-    pattern = FIELD + ("," + FIELD) * (n - 1)
-    return f"""(
-        SELECT string_split(replace(line, '"', ''), ',') AS f
-        FROM {lines_relation(kind)}
-        WHERE regexp_full_match(line, '{pattern}')
-    )"""
+    names = [f"f{i}" for i in range(1, n + 1)]
+    files = sorted(glob.glob(os.path.join(DATA, kind, "*.csv")))
+    with ThreadPoolExecutor(NCPU) as ex:
+        cr = list(ex.map(has_cr, files))
+    frames = []
+    fast = [p for p, c in zip(files, cr) if not c]
+    if fast:
+        frames.append(pl.scan_csv(fast, separator="\x01", quote_char=None, has_header=True, new_columns=["line"],
+                                  schema={"line": pl.String}, infer_schema=False))
+    for p, c in zip(files, cr):
+        if c:
+            with open(p, encoding="utf-8", newline="") as f:
+                frames.append(pl.LazyFrame({"line": f.read().split("\n")[1:]}, schema={"line": pl.String}))
+    if not frames:
+        return pl.DataFrame(schema={c: pl.String for c in names})
+    pattern = "^" + FIELD + ("," + FIELD) * (n - 1) + "$"
+    return (pl.concat(frames)
+            .filter(pl.col("line").str.contains(pattern))
+            .select(pl.col("line").str.replace_all('"', "", literal=True)
+                    .str.split_exact(",", n - 1).struct.rename_fields(names).alias("s"))
+            .unnest("s")
+            .collect())
 
 
 # --- Small dimension tables -----------------------------------------------
@@ -151,11 +163,13 @@ sql(f"""CREATE TABLE campaigns AS SELECT * FROM read_csv('{os.path.join(DATA, "c
 
 # --- Links: who is one person ---------------------------------------------
 
+con.register("links_f", parse_fields("links", 2))
 sql(f"""
 CREATE TABLE links AS
-SELECT f[1] AS a, f[2] AS b FROM {fields_relation("links", 2)}
-WHERE f[1] <> '' AND f[2] <> ''
+SELECT f1 AS a, f2 AS b FROM links_f
+WHERE f1 <> '' AND f2 <> ''
 """, "links parsed")
+con.unregister("links_f")
 sql("""
 CREATE TABLE link_ids AS
 SELECT id, (row_number() OVER () - 1)::INTEGER AS k
@@ -185,17 +199,19 @@ con.unregister("comp_arrow")
 # Judging every copy before dedup is the same as judging only the kept copy,
 # because the flag travels with the copy it belongs to.
 
+con.register("events_f", parse_fields("events", 7))
+log("events parsed")
 sql(f"""
 CREATE TABLE ev AS
 WITH parsed AS (
-    SELECT f[1] AS event_id, f[2] AS user_id, f[6] AS product_id,
-           parse_ts(f[3]) AS ts, ts_iso(f[4]) AS ingest_ms,
-           f[5] = 'purchase' AS is_purchase,
-           CASE WHEN f[5] = 'purchase' AND regexp_full_match(f[7], '[0-9]+') AND length(ltrim(f[7], '0')) <= 8
-                THEN try_cast(f[7] AS INTEGER) END AS price,
-           f[5] IN ('view', 'cart', 'purchase') AND f[2] <> '' AND f[6] <> '' AS ok
-    FROM {fields_relation("events", 7)}
-    WHERE f[1] <> ''
+    SELECT f1 AS event_id, f2 AS user_id, f6 AS product_id,
+           parse_ts(f3) AS ts, ts_iso(f4) AS ingest_ms,
+           f5 = 'purchase' AS is_purchase,
+           CASE WHEN f5 = 'purchase' AND regexp_full_match(f7, '[0-9]+') AND length(ltrim(f7, '0')) <= 8
+                THEN try_cast(f7 AS INTEGER) END AS price,
+           f5 IN ('view', 'cart', 'purchase') AND f2 <> '' AND f6 <> '' AS ok
+    FROM events_f
+    WHERE f1 <> ''
 ), kept AS (
     SELECT arg_min(struct_pack(user_id, product_id, ts, ingest_ms, is_purchase, price, ok), ingest_ms) AS e
     FROM parsed GROUP BY event_id
@@ -210,7 +226,8 @@ WHERE k.e.ok
   AND k.e.ts >= {WS} AND k.e.ts < {WE}
   AND (NOT k.e.is_purchase OR k.e.price BETWEEN 1 AND 10000000)
   AND k.e.ingest_ms - k.e.ts <= {DAY}
-""", "events parsed, deduped, validated")
+""", "events deduped, validated")
+con.unregister("events_f")
 
 # --- Sessions -------------------------------------------------------------
 # A row starts a session when the gap to the previous row is over 30 min.
@@ -235,18 +252,20 @@ FROM ev_s GROUP BY person, start
 
 # --- Clicks ---------------------------------------------------------------
 
+con.register("clicks_f", parse_fields("clicks", 4))
 sql(f"""
 CREATE TABLE clk AS
 SELECT DISTINCT coalesce(m.person, c.user_id) AS person, c.click_id, c.campaign_id, c.ts
 FROM (
-    SELECT f[1] AS click_id, f[2] AS user_id, f[3] AS campaign_id, parse_ts(f[4]) AS ts
-    FROM {fields_relation("clicks", 4)}
-    WHERE f[1] <> '' AND f[2] <> ''
+    SELECT f1 AS click_id, f2 AS user_id, f3 AS campaign_id, parse_ts(f4) AS ts
+    FROM clicks_f
+    WHERE f1 <> '' AND f2 <> ''
 ) c
 LEFT JOIN idmap m ON c.user_id = m.id
 WHERE c.ts >= {WS - WEEK} AND c.ts < {WE}
   AND c.campaign_id IN (SELECT campaign_id FROM campaigns)
 """, "clicks parsed + validated")
+con.unregister("clicks_f")
 
 # --- Credit: the latest click at or before the session start, within 7 days.
 # Ties in ts go to the smallest click_id, so collapse each (person, ts) first.
