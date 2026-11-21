@@ -82,30 +82,32 @@ WS = parse_f1(manifest["window_start"])
 WE = parse_f1(manifest["window_end"])
 log(f"window {manifest['window_start']} .. {manifest['window_end']}")
 
-# --- Macros: timestamps, digits -------------------------------------------
-# Timestamps become BIGINT epoch ms, or NULL when bad. [0-9] (never \d) keeps
-# digits ASCII. The calendar check is a DATE cast, which rejects Feb 30 etc.
+sql("CREATE MACRO ms_to_day(ms) AS (DATE '1970-01-01' + (ms // 86400000)::INTEGER)")
 
-sql(r"""
-CREATE MACRO ts_iso(s) AS (
-    (try_cast(substr(s, 1, 10) AS DATE) - DATE '1970-01-01')::BIGINT * 86400000
-    + try_cast(substr(s, 12, 2) AS BIGINT) * 3600000
-    + try_cast(substr(s, 15, 2) AS BIGINT) * 60000
-    + try_cast(substr(s, 18, 2) AS BIGINT) * 1000
-);
-CREATE MACRO parse_ts(s) AS (
-    CASE
-    WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])') THEN
-        CASE WHEN length(s) = 20 THEN ts_iso(s)
-             ELSE ts_iso(s) - (CASE WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END)
-                  * (try_cast(substr(s, 21, 2) AS BIGINT) * 3600000 + try_cast(substr(s, 24, 2) AS BIGINT) * 60000)
-        END
-    WHEN regexp_full_match(s, '[0-9]+') THEN
-        CASE WHEN length(ltrim(s, '0')) <= 18 THEN try_cast(s AS BIGINT) END
-    END
-);
-CREATE MACRO ms_to_day(ms) AS (DATE '1970-01-01' + (ms // 86400000)::INTEGER);
-""")
+# --- Timestamps -----------------------------------------------------------
+# A Polars expression: BIGINT epoch ms, or null when bad. [0-9] (never \d)
+# keeps digits ASCII, and the date parse rejects impossible days like Feb 30.
+# Polars evaluates every when/then branch on every row, so all casts are
+# non-strict. F3 values over 18 significant digits can't fit in an i64, and
+# are far outside any window anyway.
+
+ISO = (r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+       r"(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$")
+
+
+def ts_expr(col):
+    s = pl.col(col)
+
+    def num(start, length):
+        return s.str.slice(start, length).cast(pl.Int64, strict=False)
+
+    days = s.str.slice(0, 10).str.to_date("%Y-%m-%d", strict=False).cast(pl.Int64)
+    local = days * DAY + num(11, 2) * 3_600_000 + num(14, 2) * 60_000 + num(17, 2) * 1000
+    offset = (pl.when(s.str.len_bytes() == 20).then(0)
+              .otherwise(pl.when(s.str.slice(19, 1) == "+").then(1).otherwise(-1)
+                         * (num(20, 2) * 3_600_000 + num(23, 2) * 60_000)))
+    epoch = s.str.contains(r"^[0-9]+$") & (s.str.strip_chars_start("0").str.len_bytes() <= 18)
+    return pl.when(s.str.contains(ISO)).then(local - offset).when(epoch).then(s.cast(pl.Int64, strict=False))
 
 # --- Parsing --------------------------------------------------------------
 # Polars reads each file as whole lines (a separator and no quote char that
@@ -125,7 +127,7 @@ def has_cr(path):
 
 
 def parse_fields(kind, n):
-    """Well-formed lines of `kind` as a Polars frame of n string columns f1..fn, quotes stripped.
+    """Well-formed lines of `kind` as a lazy Polars frame of n string columns f1..fn, quotes stripped.
 
     A line is well-formed when it has exactly n fields and every quote wraps a
     whole field; one regex checks both. Empty fields stay '', never null.
@@ -144,14 +146,13 @@ def parse_fields(kind, n):
             with open(p, encoding="utf-8", newline="") as f:
                 frames.append(pl.LazyFrame({"line": f.read().split("\n")[1:]}, schema={"line": pl.String}))
     if not frames:
-        return pl.DataFrame(schema={c: pl.String for c in names})
+        return pl.LazyFrame(schema={c: pl.String for c in names})
     pattern = "^" + FIELD + ("," + FIELD) * (n - 1) + "$"
     return (pl.concat(frames)
             .filter(pl.col("line").str.contains(pattern))
             .select(pl.col("line").str.replace_all('"', "", literal=True)
                     .str.split_exact(",", n - 1).struct.rename_fields(names).alias("s"))
-            .unnest("s")
-            .collect())
+            .unnest("s"))
 
 
 # --- Small dimension tables -----------------------------------------------
@@ -163,7 +164,7 @@ sql(f"""CREATE TABLE campaigns AS SELECT * FROM read_csv('{os.path.join(DATA, "c
 
 # --- Links: who is one person ---------------------------------------------
 
-con.register("links_f", parse_fields("links", 2))
+con.register("links_f", parse_fields("links", 2).collect())
 sql(f"""
 CREATE TABLE links AS
 SELECT f1 AS a, f2 AS b FROM links_f
@@ -194,27 +195,29 @@ SELECT c.id, n.person FROM c JOIN (SELECT comp, min(id) AS person FROM c GROUP B
 con.unregister("comp_arrow")
 
 # --- Events ---------------------------------------------------------------
-# One streaming pass: parse each copy into typed values plus an `ok` flag for
-# the field rules, then keep the copy with the smallest ingest_ts per event_id.
+# Polars turns each copy into typed values plus an `ok` flag for the field
+# rules; DuckDB then keeps the copy with the smallest ingest_ts per event_id.
 # Judging every copy before dedup is the same as judging only the kept copy,
 # because the flag travels with the copy it belongs to.
 
-con.register("events_f", parse_fields("events", 7))
+col = pl.col
+events_f = (parse_fields("events", 7)
+            .filter(col("f1") != "")
+            .select(event_id=col("f1"), user_id=col("f2"), product_id=col("f6"),
+                    ts=ts_expr("f3"), ingest_ms=ts_expr("f4"),
+                    is_purchase=col("f5") == "purchase",
+                    price=pl.when((col("f5") == "purchase") & col("f7").str.contains(r"^[0-9]+$")
+                                  & (col("f7").str.strip_chars_start("0").str.len_bytes() <= 8))
+                          .then(col("f7").cast(pl.Int32, strict=False)),
+                    ok=col("f5").is_in(["view", "cart", "purchase"]) & (col("f2") != "") & (col("f6") != ""))
+            .collect())
+con.register("events_f", events_f)
 log("events parsed")
 sql(f"""
 CREATE TABLE ev AS
-WITH parsed AS (
-    SELECT f1 AS event_id, f2 AS user_id, f6 AS product_id,
-           parse_ts(f3) AS ts, ts_iso(f4) AS ingest_ms,
-           f5 = 'purchase' AS is_purchase,
-           CASE WHEN f5 = 'purchase' AND regexp_full_match(f7, '[0-9]+') AND length(ltrim(f7, '0')) <= 8
-                THEN try_cast(f7 AS INTEGER) END AS price,
-           f5 IN ('view', 'cart', 'purchase') AND f2 <> '' AND f6 <> '' AS ok
-    FROM events_f
-    WHERE f1 <> ''
-), kept AS (
+WITH kept AS (
     SELECT arg_min(struct_pack(user_id, product_id, ts, ingest_ms, is_purchase, price, ok), ingest_ms) AS e
-    FROM parsed GROUP BY event_id
+    FROM events_f GROUP BY event_id
 )
 SELECT coalesce(m.person, k.e.user_id) AS person, k.e.ts AS ts, k.e.is_purchase AS is_purchase,
        coalesce(p.category, 'unknown') AS category,
@@ -228,6 +231,7 @@ WHERE k.e.ok
   AND k.e.ingest_ms - k.e.ts <= {DAY}
 """, "events deduped, validated")
 con.unregister("events_f")
+del events_f
 
 # --- Sessions -------------------------------------------------------------
 # A row starts a session when the gap to the previous row is over 30 min.
@@ -252,15 +256,14 @@ FROM ev_s GROUP BY person, start
 
 # --- Clicks ---------------------------------------------------------------
 
-con.register("clicks_f", parse_fields("clicks", 4))
+con.register("clicks_f", parse_fields("clicks", 4)
+             .filter((col("f1") != "") & (col("f2") != ""))
+             .select(click_id=col("f1"), user_id=col("f2"), campaign_id=col("f3"), ts=ts_expr("f4"))
+             .collect())
 sql(f"""
 CREATE TABLE clk AS
 SELECT DISTINCT coalesce(m.person, c.user_id) AS person, c.click_id, c.campaign_id, c.ts
-FROM (
-    SELECT f1 AS click_id, f2 AS user_id, f3 AS campaign_id, parse_ts(f4) AS ts
-    FROM clicks_f
-    WHERE f1 <> '' AND f2 <> ''
-) c
+FROM clicks_f c
 LEFT JOIN idmap m ON c.user_id = m.id
 WHERE c.ts >= {WS - WEEK} AND c.ts < {WE}
   AND c.campaign_id IN (SELECT campaign_id FROM campaigns)
