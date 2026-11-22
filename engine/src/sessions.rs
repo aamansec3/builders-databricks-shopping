@@ -51,19 +51,12 @@ impl Acc {
     }
 }
 
-/// Events and clicks, keyed person << shift | (ts - their window start) so that
-/// sorting the keys sorts by (person, ts), and partitioned by person.
-pub struct Input<'a> {
-    pub ekey: &'a [i64],
-    /// price << 16 | category << 1 | is_purchase
-    pub epay: &'a [i64],
-    pub eorder: &'a [u32],
-    pub eoff: &'a [usize],
+/// Kept events as (key, pay) and valid clicks as (key, campaign, click row),
+/// partitioned by person. key is person << shift | (ts - its window start), so
+/// sorting keys sorts by (person, ts); pay is price << 16 | category << 1 |
+/// is_purchase.
+pub struct Input {
     pub eshift: u32,
-    pub ckey: &'a [i64],
-    pub camp: &'a [u32],
-    pub corder: &'a [u32],
-    pub coff: &'a [usize],
     pub cshift: u32,
     pub ws: i64,
     pub ncat: usize,
@@ -72,17 +65,36 @@ pub struct Input<'a> {
     pub ndays: usize,
 }
 
-pub fn run<'a, C>(inp: &Input, click_id: C) -> (Vec<UserDay>, Acc)
+/// v split at off into the slices of partitions 0..off.len() - 2.
+fn split<'a, T>(mut v: &'a mut [T], off: &[usize]) -> Vec<&'a mut [T]> {
+    let mut parts = Vec::with_capacity(off.len() - 2);
+    for p in 0..off.len() - 2 {
+        let (a, b) = v.split_at_mut(off[p + 1] - off[p]);
+        parts.push(a);
+        v = b;
+    }
+    parts
+}
+
+#[allow(clippy::type_complexity)]
+pub fn run<'a, C>(
+    inp: &Input,
+    events: &mut [(i64, i64)],
+    eoff: &[usize],
+    clicks: &mut [(i64, u32, u32)],
+    coff: &[usize],
+    click_id: C,
+) -> (Vec<UserDay>, Acc)
 where
     C: Fn(u32) -> &'a [u8] + Sync,
 {
-    let nq = inp.eoff.len() - 2;
-    (0..nq)
+    split(events, eoff)
         .into_par_iter()
+        .zip(split(clicks, coff))
         .fold(
             || (Vec::new(), Acc::new(inp.ncamp, inp.ndays)),
-            |(mut rows, mut acc), q| {
-                partition(inp, &click_id, q, &mut rows, &mut acc);
+            |(mut rows, mut acc), (ev, cv)| {
+                partition(inp, &click_id, ev, cv, &mut rows, &mut acc);
                 (rows, acc)
             },
         )
@@ -94,19 +106,20 @@ where
         .unwrap_or_else(|| (Vec::new(), Acc::new(inp.ncamp, inp.ndays)))
 }
 
-fn partition<'a, C>(inp: &Input, click_id: &C, q: usize, rows: &mut Vec<UserDay>, acc: &mut Acc)
-where
+fn partition<'a, C>(
+    inp: &Input,
+    click_id: &C,
+    ev: &mut [(i64, i64)],
+    cv: &mut [(i64, u32, u32)],
+    rows: &mut Vec<UserDay>,
+    acc: &mut Acc,
+) where
     C: Fn(u32) -> &'a [u8],
 {
-    let erows = &inp.eorder[inp.eoff[q]..inp.eoff[q + 1]];
-    if erows.is_empty() {
+    if ev.is_empty() {
         return;
     }
-    let mut ev: Vec<(i64, i64)> = erows.iter().map(|&r| (inp.ekey[r as usize], inp.epay[r as usize])).collect();
     ev.sort_unstable_by_key(|e| e.0);
-    let crows = &inp.corder[inp.coff[q]..inp.coff[q + 1]];
-    let mut cv: Vec<(i64, u32, u32)> =
-        crows.iter().map(|&r| (inp.ckey[r as usize], inp.camp[r as usize], r)).collect();
     cv.sort_unstable_by_key(|c| c.0);
 
     let (es, cs) = (inp.eshift, inp.cshift);

@@ -6,7 +6,7 @@
 //! UTF-8 is safe to scan byte by byte: every byte of a multi-byte character is
 //! >= 0x80, so none can be mistaken for a comma, quote or newline.
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
@@ -34,6 +34,26 @@ impl<T> Out<T> {
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn at<'a>(self, i: usize) -> &'a mut T {
         unsafe { &mut *self.0.add(i) }
+    }
+}
+
+/// A vec of n all-zero values. Only for types for which all-zero bytes are a
+/// valid value. The memory comes zeroed from the kernel, so untouched pages
+/// cost nothing; big ones ask for 2 MB huge pages, which cuts page faults 512x.
+pub fn zeroed<T: Copy>(n: usize) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<T>(n).unwrap();
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout);
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        if layout.size() >= 4 << 20 {
+            libc::madvise(p as *mut libc::c_void, layout.size(), libc::MADV_HUGEPAGE);
+        }
+        Vec::from_raw_parts(p as *mut T, n, n)
     }
 }
 
@@ -219,14 +239,16 @@ impl Input {
             .unwrap_or_default();
         paths.retain(|p| p.extension().is_some_and(|x| x == "csv"));
         paths.sort();
+        // populate: map every page up front, in one call per file (files in
+        // parallel), instead of one page fault per 4 KB page during parsing.
         let maps: Vec<Mmap> = paths
-            .iter()
+            .par_iter()
             .filter_map(|p| {
                 let f = File::open(p).expect("open input file");
                 if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
                     return None;
                 }
-                Some(unsafe { Mmap::map(&f).expect("map input file") })
+                Some(unsafe { MmapOptions::new().populate().map(&f).expect("map input file") })
             })
             .collect();
         // Chunk boundaries: every CHUNK bytes, moved forward to just after a \n.

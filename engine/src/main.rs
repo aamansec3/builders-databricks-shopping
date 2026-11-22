@@ -15,10 +15,10 @@ mod output;
 mod parse;
 mod sessions;
 
-use group::{GROUP_PARTS, group, hash_part, partition, ungroup};
+use group::{GROUP_PARTS, group, hash_part, scatter};
 use output::Column;
 use parquet::data_type::ByteArray;
-use parse::{DAY, Input, NULL, Out, bytes, digits, fields, hash, ts};
+use parse::{DAY, Input, NULL, Out, bytes, digits, fields, hash, ts, zeroed};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use sessions::WEEK;
@@ -74,27 +74,39 @@ struct Click {
     ok: bool,
 }
 
+/// One copy of an event, in its hash partition.
+#[derive(Clone, Copy)]
+struct EventCopy {
+    hash: u64,
+    ingest: i64,
+    row: u32,
+}
+
+/// A user ID in its hash partition: up to 16 bytes of it packed in w0, w1.
+#[derive(Clone, Copy)]
+struct UserId {
+    hash: u64,
+    w0: u64,
+    w1: u64,
+    item: u32,
+    n: u32,
+}
+
+/// The first 16 bytes of b, zero-padded, as two words. With the length, this
+/// identifies a string of up to 16 bytes exactly.
+#[inline]
+fn pack(b: &[u8]) -> (u64, u64) {
+    let mut t = [0u8; 16];
+    let k = b.len().min(16);
+    t[..k].copy_from_slice(&b[..k]);
+    (u64::from_le_bytes(t[..8].try_into().unwrap()), u64::from_le_bytes(t[8..].try_into().unwrap()))
+}
+
 /// A user ID to number, from a link, a kept event or a valid click.
 #[derive(Clone, Copy)]
 struct Item {
     p: u64,
     n: u32,
-}
-
-/// A vec of n all-zero values (calloc: untouched pages cost nothing). Only for
-/// types for which all-zero bytes are a valid value.
-fn zeroed<T: Copy>(n: usize) -> Vec<T> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let layout = std::alloc::Layout::array::<T>(n).unwrap();
-    unsafe {
-        let p = std::alloc::alloc_zeroed(layout) as *mut T;
-        if p.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        Vec::from_raw_parts(p, n, n)
-    }
 }
 
 /// The value of "key": "..." in a flat JSON object.
@@ -118,13 +130,43 @@ fn dimension(text: &[u8]) -> Vec<(&[u8], &[u8])> {
     rows
 }
 
+/// This process's CPU time so far, in seconds: (user, sys). Linux counts it in
+/// clock ticks of 1/100 s, fields 14 and 15 of /proc/self/stat.
+fn cpu_time() -> (f64, f64) {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Skip past "pid (command)": the command may hold spaces.
+    let rest = stat.rsplit_once(')').map_or("", |r| r.1);
+    let f: Vec<f64> = rest.split_whitespace().skip(11).take(2).filter_map(|x| x.parse().ok()).collect();
+    if f.len() == 2 { (f[0] / 100.0, f[1] / 100.0) } else { (0.0, 0.0) }
+}
+
+/// Logs each stage with its wall time and the CPU time it used, user and sys
+/// (kernel). CPU time is a steadier measure than wall time on a busy machine.
+struct Stages {
+    start: Instant,
+    last: std::cell::Cell<(f64, f64, f64)>,
+}
+
+impl Stages {
+    fn new() -> Stages {
+        let (u, s) = cpu_time();
+        Stages { start: Instant::now(), last: std::cell::Cell::new((0.0, u, s)) }
+    }
+    fn log(&self, msg: String) {
+        let wall = self.start.elapsed().as_secs_f64();
+        let (u, s) = cpu_time();
+        let (w0, u0, s0) = self.last.replace((wall, u, s));
+        eprintln!("[{wall:6.2}s] {:5.2}s wall {:5.2}s user {:5.2}s sys  {msg}", wall - w0, u - u0, s - s0);
+    }
+}
+
 fn bits(x: i64) -> u32 {
     64 - (x.max(1) as u64).leading_zeros()
 }
 
 fn main() {
-    let t0 = Instant::now();
-    let log = |msg: String| eprintln!("[{:6.2}s] {msg}", t0.elapsed().as_secs_f64());
+    let stages = Stages::new();
+    let log = |msg: String| stages.log(msg);
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out = PathBuf::from(env("OUTPUT_DIR", "/output"));
@@ -156,6 +198,7 @@ fn main() {
     let li = Input::open(&data.join("links"));
     let ei = Input::open(&data.join("events"));
     let ci = Input::open(&data.join("clicks"));
+    log(format!("mapped {} MB, counted lines", (li.bytes + ei.bytes + ci.bytes) >> 20));
 
     let mut links: Vec<Link> = zeroed(li.rows);
     let o = Out::new(&mut links);
@@ -168,6 +211,8 @@ fn main() {
             unsafe { o.set(r, l) };
         }
     });
+
+    log("parsed links".into());
 
     let mut events: Vec<Event> = zeroed(ei.rows);
     let o = Out::new(&mut events);
@@ -200,6 +245,8 @@ fn main() {
         unsafe { o.set(r, e) };
     });
 
+    log("parsed events".into());
+
     let mut clicks: Vec<Click> = zeroed(ci.rows);
     let o = Out::new(&mut clicks);
     ci.for_each_line(|r, line, header| {
@@ -225,22 +272,19 @@ fn main() {
         };
         unsafe { o.set(r, c) };
     });
-    log(format!(
-        "parsed {} MB: {} link, {} event, {} click lines",
-        (li.bytes + ei.bytes + ci.bytes) >> 20,
-        links.len(),
-        events.len(),
-        clicks.len()
-    ));
+    log(format!("parsed clicks ({} link, {} event, {} click lines)", links.len(), events.len(), clicks.len()));
 
     // --- Events: keep the earliest copy of each event_id, then validate it
     let part: Vec<u16> =
         events.par_iter().map(|e| if e.ok { hash_part(e.hash) } else { GROUP_PARTS as u16 }).collect();
-    let (order, off) = partition(&part, GROUP_PARTS);
+    let (copies, off) = scatter(&part, GROUP_PARTS, |i| {
+        let e = &events[i];
+        EventCopy { hash: e.hash, ingest: e.ingest, row: i as u32 }
+    });
     drop(part);
-    let g = group(&order, &off, |r| events[r as usize].hash, |r| {
-        let e = &events[r as usize];
-        bytes(e.eid, e.eid_n)
+    let g = group(&copies, &off, |c| c.hash, |a, b| {
+        let (x, y) = (&events[a.row as usize], &events[b.row as usize]);
+        bytes(x.eid, x.eid_n) == bytes(y.eid, y.eid_n)
     });
     let mut chosen = vec![false; events.len()];
     let o = Out::new(&mut chosen);
@@ -250,19 +294,19 @@ fn main() {
         let g0 = g.goff[p];
         let mut best = vec![(u32::MAX, i64::MAX); g.goff[p + 1] - g0];
         for j in off[p]..off[p + 1] {
-            let r = order[j];
-            let ing = events[r as usize].ingest;
-            let key = if ing == NULL { i64::MAX } else { ing };
-            let b = &mut best[g.gidp[j] as usize - g0];
+            let c = &copies[j];
+            let key = if c.ingest == NULL { i64::MAX } else { c.ingest };
+            let b = &mut best[g.gid[j] as usize - g0];
             if b.0 == u32::MAX || key < b.1 {
-                *b = (r, key);
+                *b = (c.row, key);
             }
         }
         for (r, _) in best {
             unsafe { o.set(r as usize, true) };
         }
     });
-    drop((order, off, g));
+    drop((copies, off, g));
+    log("events deduped".into());
     let keep: Vec<bool> = events
         .par_iter()
         .zip(&chosen)
@@ -278,7 +322,7 @@ fn main() {
         })
         .collect();
     drop(chosen);
-    log("events deduped, validated".into());
+    log("events validated".into());
 
     // --- People: number every user ID (both sides of each link, then each
     // kept event, then each valid click), then join linked ones.
@@ -304,19 +348,29 @@ fn main() {
     });
     events.par_iter().zip(&keep).enumerate().for_each(|(j, (e, &k))| put(2 * nl + j, e.uid, e.uid_n, k));
     clicks.par_iter().enumerate().for_each(|(j, c)| put(2 * nl + ne + j, c.uid, c.uid_n, c.ok));
-    let (order, off) = partition(&part, GROUP_PARTS);
-    drop(part);
-    let g = group(&order, &off, |r| ih[r as usize], |r| {
-        let it = &items[r as usize];
-        bytes(it.p, it.n)
-    });
-    let ugid = ungroup(&g, &order, m);
-    drop((order, off, ih));
-    let users = g.rep.len();
+    log("user IDs hashed".into());
     let item_str = |i: u32| {
         let it = &items[i as usize];
         bytes(it.p, it.n)
     };
+    // An ID of up to 16 bytes is held whole in the record (w0, w1, n), so two
+    // of them compare without reading the input again; longer ones compare bytes.
+    let (ids, off) = scatter(&part, GROUP_PARTS, |i| {
+        let it = &items[i];
+        let (w0, w1) = pack(bytes(it.p, it.n));
+        UserId { hash: ih[i], w0, w1, item: i as u32, n: it.n }
+    });
+    drop((part, ih));
+    let g = group(&ids, &off, |u| u.hash, |a, b| {
+        a.n == b.n && a.w0 == b.w0 && a.w1 == b.w1 && (a.n <= 16 || item_str(a.item) == item_str(b.item))
+    });
+    let mut ugid: Vec<u32> = zeroed(m); // only read for items in use
+    let o = Out::new(&mut ugid);
+    ids.par_iter().zip(&g.gid).for_each(|(u, &gi)| unsafe { o.set(u.item as usize, gi) });
+    let rep: Vec<u32> = g.rep.iter().map(|&j| ids[j as usize].item).collect();
+    drop((ids, off, g));
+    let users = rep.len();
+    log(format!("user IDs grouped: {users}"));
     // Union-find over the links; a person is named by their byte-wise smallest ID.
     let mut parent: Vec<u32> = (0..users as u32).collect();
     fn root(parent: &mut [u32], mut x: u32) -> u32 {
@@ -339,70 +393,46 @@ fn main() {
     }
     let person: Vec<u32> = (0..users as u32).map(|u| root(&mut parent, u)).collect();
     drop(parent);
-    let mut name = g.rep.clone();
+    let mut name = rep.clone();
     for u in 0..users {
         let r = person[u] as usize;
-        if r != u && item_str(g.rep[u]) < item_str(name[r]) {
-            name[r] = g.rep[u];
+        if r != u && item_str(rep[u]) < item_str(name[r]) {
+            name[r] = rep[u];
         }
     }
-    log(format!("people: {users} user IDs"));
+    log("people joined (union-find)".into());
 
     // --- Sessions, credit, assists
     // Sort keys are person << shift | (ts - earliest ts), and persons < users.
     let eshift = bits(we - ws);
     let cshift = bits(we - ws + WEEK);
     assert!(bits(users as i64) + cshift <= 62, "window too long for the sort keys");
-    let mut ekey: Vec<i64> = zeroed(ne);
-    let mut epay: Vec<i64> = zeroed(ne);
-    let mut epart: Vec<u16> = zeroed(ne);
-    let (ok_, op_, opart) = (Out::new(&mut ekey), Out::new(&mut epay), Out::new(&mut epart));
-    events.par_iter().zip(&keep).enumerate().for_each(|(j, (e, &k))| unsafe {
-        if !k {
-            opart.set(j, PERSON_PARTS as u16);
-            return;
-        }
-        let p = person[ugid[2 * nl + j] as usize] as i64;
-        ok_.set(j, (p << eshift) | (e.ts - ws));
+    let person_of = |item: usize| person[ugid[item] as usize] as i64;
+    let epart: Vec<u16> = (0..ne)
+        .into_par_iter()
+        .map(|j| if keep[j] { (person_of(2 * nl + j) as usize % PERSON_PARTS) as u16 } else { PERSON_PARTS as u16 })
+        .collect();
+    let (mut erecs, eoff) = scatter(&epart, PERSON_PARTS, |j| {
+        let e = &events[j];
         let pay = if e.typ == PURCHASE { ((e.price as i64) << 16) | ((e.cat as i64) << 1) | 1 } else { (e.cat as i64) << 1 };
-        op_.set(j, pay);
-        opart.set(j, (p as usize % PERSON_PARTS) as u16);
+        ((person_of(2 * nl + j) << eshift) | (e.ts - ws), pay)
     });
-    let mut ckey: Vec<i64> = zeroed(nc);
-    let mut cpart: Vec<u16> = zeroed(nc);
-    let (ok_, opart) = (Out::new(&mut ckey), Out::new(&mut cpart));
-    clicks.par_iter().enumerate().for_each(|(j, c)| unsafe {
-        if !c.ok {
-            opart.set(j, PERSON_PARTS as u16);
-            return;
-        }
-        let p = person[ugid[2 * nl + ne + j] as usize] as i64;
-        ok_.set(j, (p << cshift) | (c.ts - (ws - WEEK)));
-        opart.set(j, (p as usize % PERSON_PARTS) as u16);
+    let cpart: Vec<u16> = (0..nc)
+        .into_par_iter()
+        .map(|j| {
+            if clicks[j].ok { (person_of(2 * nl + ne + j) as usize % PERSON_PARTS) as u16 } else { PERSON_PARTS as u16 }
+        })
+        .collect();
+    let (mut crecs, coff) = scatter(&cpart, PERSON_PARTS, |j| {
+        let c = &clicks[j];
+        ((person_of(2 * nl + ne + j) << cshift) | (c.ts - (ws - WEEK)), c.camp, j as u32)
     });
-    let camp: Vec<u32> = clicks.par_iter().map(|c| c.camp).collect();
-    let (eorder, eoff) = partition(&epart, PERSON_PARTS);
-    let (corder, coff) = partition(&cpart, PERSON_PARTS);
+    drop((epart, cpart, ugid));
+    log("sort keys built".into());
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
-    let inp = sessions::Input {
-        ekey: &ekey,
-        epay: &epay,
-        eorder: &eorder,
-        eoff: &eoff,
-        eshift,
-        ckey: &ckey,
-        camp: &camp,
-        corder: &corder,
-        coff: &coff,
-        cshift,
-        ws,
-        ncat: categories.len(),
-        ncamp,
-        day0,
-        ndays,
-    };
-    let (rows, acc) = sessions::run(&inp, |r| {
+    let inp = sessions::Input { eshift, cshift, ws, ncat: categories.len(), ncamp, day0, ndays };
+    let (rows, acc) = sessions::run(&inp, &mut erecs, &eoff, &mut crecs, &coff, |r| {
         let c = &clicks[r as usize];
         bytes(c.cid, c.cid_n)
     });
@@ -447,6 +477,8 @@ fn main() {
     };
     rayon::join(user_daily, campaign_daily);
     log("wrote user_daily and campaign_daily".into());
+    let (u, s) = cpu_time();
+    eprintln!("total: {:.2}s wall, {u:.2}s user, {s:.2}s sys", stages.start.elapsed().as_secs_f64());
 }
 
 fn write(path: &Path, schema: &str, columns: Vec<Column>) {
