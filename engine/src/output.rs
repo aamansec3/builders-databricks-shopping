@@ -19,7 +19,9 @@ pub enum Column {
 /// Write the columns, in schema order, to path.
 pub fn write(path: &Path, schema: &str, columns: Vec<Column>) -> parquet::errors::Result<()> {
     let schema = Arc::new(parse_message_type(schema)?);
-    let props = Arc::new(WriterProperties::builder().build());
+    // No dictionary encoding: nearly every user_id is distinct, so building a
+    // dictionary is wasted work (and the small columns don't need one).
+    let props = Arc::new(WriterProperties::builder().set_dictionary_enabled(false).build());
     let mut writer = SerializedFileWriter::new(File::create(path)?, schema, props)?;
     let mut group = writer.next_row_group()?;
     for column in columns {

@@ -30,7 +30,7 @@ const VIEW: u8 = 1;
 const CART: u8 = 2;
 const PURCHASE: u8 = 3;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Link {
     a: u64,
     b: u64,
@@ -44,7 +44,7 @@ struct Link {
 /// unless it's a purchase whose price is digits only with at most 8 significant
 /// digits. cat is the product's category (unknown when not in products.csv), or
 /// -1 when product_id is empty: only the category is ever needed, not the ID.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Event {
     eid: u64,
     uid: u64,
@@ -63,7 +63,7 @@ struct Event {
 /// ts in the click window, campaign in campaigns.csv. Copies of a click are
 /// identical, so they aren't deduped: a copy can't change which campaign a
 /// session credits, or the set of campaigns that assist it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Click {
     cid: u64,
     uid: u64,
@@ -194,85 +194,87 @@ fn main() {
         campaigns.iter().enumerate().map(|(i, &(c, _))| (c, i as u32)).collect();
     let ncamp = campaigns.len();
 
-    // --- Parse
+    // --- Parse. A background thread asks the kernel to start reading every
+    // input file at once; parsing goes block by block as the data arrives.
     let li = Input::open(&data.join("links"));
     let ei = Input::open(&data.join("events"));
     let ci = Input::open(&data.join("clicks"));
-    log(format!("mapped {} MB, counted lines", (li.bytes + ei.bytes + ci.bytes) >> 20));
-
-    let mut links: Vec<Link> = zeroed(li.rows);
-    let o = Out::new(&mut links);
-    li.for_each_line(|r, line, header| {
-        let mut fb = [(0, 0); 2];
-        let good = !header && fields(line, &mut fb) && fb[0].1 > fb[0].0 && fb[1].1 > fb[1].0;
-        if good {
+    let (links, events, clicks) = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            li.prefetch();
+            ei.prefetch();
+            ci.prefetch();
+        });
+        let links: Vec<Link> = li.parse(|line, header| {
+            let mut fb = [(0, 0); 2];
+            if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 || fb[1].1 == fb[1].0 {
+                return Link::default();
+            }
             let (a, b) = (&line[fb[0].0..fb[0].1], &line[fb[1].0..fb[1].1]);
-            let l = Link { a: a.as_ptr() as u64, b: b.as_ptr() as u64, a_n: a.len() as u32, b_n: b.len() as u32, ok: true };
-            unsafe { o.set(r, l) };
-        }
+            Link { a: a.as_ptr() as u64, b: b.as_ptr() as u64, a_n: a.len() as u32, b_n: b.len() as u32, ok: true }
+        });
+        log("parsed links".into());
+
+        let events: Vec<Event> = ei.parse(|line, header| {
+            let mut fb = [(0, 0); 7];
+            if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 {
+                return Event::default();
+            }
+            let f = |k: usize| &line[fb[k].0..fb[k].1];
+            let (eid, uid, pid) = (f(0), f(1), f(5));
+            let typ = match f(4) {
+                b"view" => VIEW,
+                b"cart" => CART,
+                b"purchase" => PURCHASE,
+                _ => 0,
+            };
+            Event {
+                eid: eid.as_ptr() as u64,
+                uid: uid.as_ptr() as u64,
+                hash: hash(eid),
+                ts: ts(f(2)),
+                ingest: ts(f(3)),
+                eid_n: eid.len() as u32,
+                uid_n: uid.len() as u32,
+                price: if typ == PURCHASE { digits(f(6), 8) as i32 } else { -1 },
+                cat: if pid.is_empty() { -1 } else { *product_cat.get(pid).unwrap_or(&unknown) },
+                typ,
+                ok: true,
+            }
+        });
+        log("parsed events".into());
+
+        let clicks: Vec<Click> = ci.parse(|line, header| {
+            let mut fb = [(0, 0); 4];
+            if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 || fb[1].1 == fb[1].0 {
+                return Click::default();
+            }
+            let f = |k: usize| &line[fb[k].0..fb[k].1];
+            let t = ts(f(3));
+            if t < ws - WEEK || t >= we {
+                return Click::default();
+            }
+            let Some(&camp) = campaign_index.get(f(2)) else { return Click::default() };
+            let (cid, uid) = (f(0), f(1));
+            Click {
+                cid: cid.as_ptr() as u64,
+                uid: uid.as_ptr() as u64,
+                ts: t,
+                cid_n: cid.len() as u32,
+                uid_n: uid.len() as u32,
+                camp,
+                ok: true,
+            }
+        });
+        (links, events, clicks)
     });
-
-    log("parsed links".into());
-
-    let mut events: Vec<Event> = zeroed(ei.rows);
-    let o = Out::new(&mut events);
-    ei.for_each_line(|r, line, header| {
-        let mut fb = [(0, 0); 7];
-        if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 {
-            return;
-        }
-        let f = |k: usize| &line[fb[k].0..fb[k].1];
-        let (eid, uid, pid) = (f(0), f(1), f(5));
-        let typ = match f(4) {
-            b"view" => VIEW,
-            b"cart" => CART,
-            b"purchase" => PURCHASE,
-            _ => 0,
-        };
-        let e = Event {
-            eid: eid.as_ptr() as u64,
-            uid: uid.as_ptr() as u64,
-            hash: hash(eid),
-            ts: ts(f(2)),
-            ingest: ts(f(3)),
-            eid_n: eid.len() as u32,
-            uid_n: uid.len() as u32,
-            price: if typ == PURCHASE { digits(f(6), 8) as i32 } else { -1 },
-            cat: if pid.is_empty() { -1 } else { *product_cat.get(pid).unwrap_or(&unknown) },
-            typ,
-            ok: true,
-        };
-        unsafe { o.set(r, e) };
-    });
-
-    log("parsed events".into());
-
-    let mut clicks: Vec<Click> = zeroed(ci.rows);
-    let o = Out::new(&mut clicks);
-    ci.for_each_line(|r, line, header| {
-        let mut fb = [(0, 0); 4];
-        if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 || fb[1].1 == fb[1].0 {
-            return;
-        }
-        let f = |k: usize| &line[fb[k].0..fb[k].1];
-        let t = ts(f(3));
-        if t < ws - WEEK || t >= we {
-            return;
-        }
-        let Some(&camp) = campaign_index.get(f(2)) else { return };
-        let (cid, uid) = (f(0), f(1));
-        let c = Click {
-            cid: cid.as_ptr() as u64,
-            uid: uid.as_ptr() as u64,
-            ts: t,
-            cid_n: cid.len() as u32,
-            uid_n: uid.len() as u32,
-            camp,
-            ok: true,
-        };
-        unsafe { o.set(r, c) };
-    });
-    log(format!("parsed clicks ({} link, {} event, {} click lines)", links.len(), events.len(), clicks.len()));
+    log(format!(
+        "parsed clicks ({} MB in all: {} link, {} event, {} click lines)",
+        (li.bytes + ei.bytes + ci.bytes) >> 20,
+        links.len(),
+        events.len(),
+        clicks.len()
+    ));
 
     // --- Events: keep the earliest copy of each event_id, then validate it
     let part: Vec<u16> =
@@ -442,20 +444,28 @@ fn main() {
     let dir = |name: &str| -> PathBuf {
         let d = out.join(name);
         std::fs::create_dir_all(&d).expect("create output folder");
-        d.join("part-0.parquet")
+        d
     };
+    // user_daily goes to one file per thread, written in parallel: the rules
+    // allow any number of part files.
     let user_daily = || {
-        let user_id = rows.par_iter().map(|r| ByteArray::from(item_str(name[r.person as usize]).to_vec())).collect();
-        let present: Vec<i16> = rows.iter().map(|r| i16::from(r.top >= 0)).collect();
-        let top = rows.iter().filter(|r| r.top >= 0).map(|r| ByteArray::from(categories[r.top as usize].to_vec())).collect();
-        write(&dir("user_daily"), output::USER_DAILY, vec![
-            Column::Str(user_id, None),
-            Column::Int32(rows.iter().map(|r| r.day).collect()),
-            Column::Int64(rows.iter().map(|r| r.sessions).collect()),
-            Column::Int64(rows.iter().map(|r| r.events).collect()),
-            Column::Int64(rows.iter().map(|r| r.revenue).collect()),
-            Column::Str(top, Some(present)),
-        ]);
+        let d = dir("user_daily");
+        let per = rows.len().div_ceil(ncpu).max(1);
+        let parts: Vec<&[sessions::UserDay]> = if rows.is_empty() { vec![&rows[..]] } else { rows.chunks(per).collect() };
+        parts.into_par_iter().enumerate().for_each(|(i, rows)| {
+            let user_id = rows.iter().map(|r| ByteArray::from(item_str(name[r.person as usize]).to_vec())).collect();
+            let present: Vec<i16> = rows.iter().map(|r| i16::from(r.top >= 0)).collect();
+            let top =
+                rows.iter().filter(|r| r.top >= 0).map(|r| ByteArray::from(categories[r.top as usize].to_vec())).collect();
+            write(&d.join(format!("part-{i}.parquet")), output::USER_DAILY, vec![
+                Column::Str(user_id, None),
+                Column::Int32(rows.iter().map(|r| r.day).collect()),
+                Column::Int64(rows.iter().map(|r| r.sessions).collect()),
+                Column::Int64(rows.iter().map(|r| r.events).collect()),
+                Column::Int64(rows.iter().map(|r| r.revenue).collect()),
+                Column::Str(top, Some(present)),
+            ]);
+        });
     };
     let campaign_daily = || {
         let cells: Vec<(usize, usize)> = (0..=ncamp)
@@ -465,7 +475,7 @@ fn main() {
         let id = |c: usize| if c == ncamp { &b"organic"[..] } else { campaigns[c].0 };
         let channel = |c: usize| if c == ncamp { &b"organic"[..] } else { campaigns[c].1 };
         let at = |v: &Vec<i64>| cells.iter().map(|&(c, d)| v[c * ndays + d]).collect();
-        write(&dir("campaign_daily"), output::CAMPAIGN_DAILY, vec![
+        write(&dir("campaign_daily").join("part-0.parquet"), output::CAMPAIGN_DAILY, vec![
             Column::Str(cells.iter().map(|&(c, _)| ByteArray::from(id(c).to_vec())).collect(), None),
             Column::Str(cells.iter().map(|&(c, _)| ByteArray::from(channel(c).to_vec())).collect(), None),
             Column::Int32(cells.iter().map(|&(_, d)| (day0 + d as i64) as i32).collect()),
@@ -479,6 +489,9 @@ fn main() {
     log("wrote user_daily and campaign_daily".into());
     let (u, s) = cpu_time();
     eprintln!("total: {:.2}s wall, {u:.2}s user, {s:.2}s sys", stages.start.elapsed().as_secs_f64());
+    // Exit now: the kernel takes back all the memory at once, faster than
+    // freeing gigabytes of vectors and mappings one by one on the way out.
+    std::process::exit(0);
 }
 
 fn write(path: &Path, schema: &str, columns: Vec<Column>) {

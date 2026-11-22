@@ -6,7 +6,7 @@
 //! UTF-8 is safe to scan byte by byte: every byte of a multi-byte character is
 //! >= 0x80, so none can be mistaken for a comma, quote or newline.
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
@@ -213,24 +213,15 @@ pub fn ts(f: &[u8]) -> i64 {
     if v < 0 { NULL } else { v }
 }
 
-/// The non-empty *.csv files of one kind, mapped, and split into chunks of
-/// whole lines. Each chunk knows its first row, so threads can parse chunks in
-/// any order and still write every line to its own row.
+/// The non-empty *.csv files of one kind, memory-mapped.
 pub struct Input {
     maps: Vec<Mmap>,
-    chunks: Vec<Chunk>,
-    pub rows: usize,
     pub bytes: usize,
 }
 
-struct Chunk {
-    file: usize,
-    start: usize,
-    end: usize,
-    row0: usize,
-}
-
-const CHUNK: usize = 1 << 20;
+/// Lines are parsed in blocks of this many bytes: a block parses the lines that
+/// start inside it (the last one may run into the next block).
+const BLOCK: usize = 1 << 20;
 
 impl Input {
     pub fn open(dir: &Path) -> Input {
@@ -239,66 +230,87 @@ impl Input {
             .unwrap_or_default();
         paths.retain(|p| p.extension().is_some_and(|x| x == "csv"));
         paths.sort();
-        // populate: map every page up front, in one call per file (files in
-        // parallel), instead of one page fault per 4 KB page during parsing.
         let maps: Vec<Mmap> = paths
-            .par_iter()
+            .iter()
             .filter_map(|p| {
                 let f = File::open(p).expect("open input file");
                 if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
                     return None;
                 }
-                Some(unsafe { MmapOptions::new().populate().map(&f).expect("map input file") })
+                Some(unsafe { Mmap::map(&f).expect("map input file") })
             })
             .collect();
-        // Chunk boundaries: every CHUNK bytes, moved forward to just after a \n.
-        let mut chunks = Vec::new();
-        for (file, m) in maps.iter().enumerate() {
-            let mut start = 0;
-            while start < m.len() {
-                let mut end = (start + CHUNK).min(m.len());
-                if end < m.len() {
-                    end = match memchr::memchr(b'\n', &m[end..]) {
-                        Some(i) => end + i + 1,
-                        None => m.len(),
-                    };
-                }
-                chunks.push(Chunk { file, start, end, row0: 0 });
-                start = end;
-            }
-        }
-        // A chunk's lines: its \n count, plus a last line with no \n at the end of a file.
-        let counts: Vec<usize> = chunks
-            .par_iter()
-            .map(|c| {
-                let data = &maps[c.file][c.start..c.end];
-                memchr::memchr_iter(b'\n', data).count() + usize::from(data.last() != Some(&b'\n'))
-            })
-            .collect();
-        let mut rows = 0;
-        for (c, n) in chunks.iter_mut().zip(counts) {
-            c.row0 = rows;
-            rows += n;
-        }
         let bytes = maps.iter().map(|m| m.len()).sum();
-        Input { maps, chunks, rows, bytes }
+        Input { maps, bytes }
     }
 
-    /// Call f(row, line, is_header) for every line, in parallel over chunks.
-    /// Line 0 of each file is its header.
-    pub fn for_each_line<F: Fn(usize, &[u8], bool) + Sync>(&self, f: F) {
-        self.chunks.par_iter().for_each(|c| {
-            let data = &self.maps[c.file][c.start..c.end];
-            let mut row = c.row0;
-            let mut s = 0;
-            for e in memchr::memchr_iter(b'\n', data) {
-                f(row, &data[s..e], c.start == 0 && s == 0);
-                row += 1;
-                s = e + 1;
-            }
-            if s < data.len() {
-                f(row, &data[s..], c.start == 0 && s == 0);
-            }
-        });
+    /// Ask the kernel to start reading every file now, in the background, so
+    /// the data is (or is on its way to being) in memory when parsing gets to it.
+    pub fn prefetch(&self) {
+        for m in &self.maps {
+            let _ = m.advise(memmap2::Advice::WillNeed);
+        }
     }
+
+    /// f(line, is_header) for every line of every file, in parallel over blocks;
+    /// line 0 of each file is its header. Each block starts as soon as a thread
+    /// is free, so on a cold disk parsing overlaps with reading.
+    pub fn parse<T, F>(&self, f: F) -> Vec<T>
+    where
+        T: Copy + Send + Sync,
+        F: Fn(&[u8], bool) -> T + Sync,
+    {
+        let blocks: Vec<(usize, usize)> = self
+            .maps
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| (0..m.len()).step_by(BLOCK).map(move |b| (i, b)))
+            .collect();
+        let parts: Vec<Vec<T>> = blocks
+            .par_iter()
+            .map(|&(i, b0)| {
+                let m = &self.maps[i][..];
+                let b1 = (b0 + BLOCK).min(m.len());
+                // The first line that starts in [b0, b1).
+                let first = if b0 == 0 {
+                    0
+                } else {
+                    memchr::memchr(b'\n', &m[b0 - 1..]).map_or(m.len(), |k| b0 + k)
+                };
+                let mut out = Vec::with_capacity((b1 - b0) / 64 + 1);
+                let mut s = first;
+                for e in memchr::memchr_iter(b'\n', &m[first..]) {
+                    if s >= b1 {
+                        break;
+                    }
+                    let e = first + e;
+                    out.push(f(&m[s..e], s == 0));
+                    s = e + 1;
+                }
+                if s < b1 && s < m.len() {
+                    out.push(f(&m[s..], s == 0)); // a last line with no \n
+                }
+                out
+            })
+            .collect();
+        concat(&parts)
+    }
+}
+
+/// The parts, end to end, copied in parallel.
+fn concat<T: Copy + Send + Sync>(parts: &[Vec<T>]) -> Vec<T> {
+    let mut offs = Vec::with_capacity(parts.len());
+    let mut total = 0;
+    for p in parts {
+        offs.push(total);
+        total += p.len();
+    }
+    let mut all: Vec<T> = zeroed(total);
+    let out = Out::new(&mut all);
+    parts.par_iter().zip(offs).for_each(|(p, o)| {
+        if !p.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(p.as_ptr(), out.at(o) as *mut T, p.len()) };
+        }
+    });
+    all
 }
