@@ -1,128 +1,113 @@
-//! Partitioning rows, and grouping equal strings exactly, in parallel.
+//! Partitioning records as they are produced, and grouping equal strings
+//! exactly within a partition.
 //!
-//! Rows are partitioned by the top bits of their hash, so equal strings always
-//! share a partition. The partition step copies each row's record (its hash
-//! and whatever else the next step needs) into its partition's slot, so each
-//! partition's records are contiguous and later steps read them front to back.
-//! Each partition, on its own thread, then builds a small hash table; records
-//! with equal hashes are compared exactly, so a collision can never merge two
-//! different strings.
+//! Each stage hands records straight to the partition the next stage needs:
+//! every thread appends to its own set of partition lists (Buckets), so no two
+//! threads ever write to the same list. Partition p of the next stage is then
+//! the p-th list of every thread's set.
+//!
+//! Records are partitioned by the top bits of a string's hash, so equal strings
+//! always share a partition. Within a partition, a LocalTable groups them;
+//! records with equal hashes are compared exactly, so a hash collision can never
+//! merge two different strings.
 
-use crate::parse::{Out, zeroed};
-use rayon::prelude::*;
-
-pub const GROUP_BITS: u32 = 10;
+pub const GROUP_BITS: u32 = 8;
 pub const GROUP_PARTS: usize = 1 << GROUP_BITS;
 
 /// The hash partition of a string with hash h.
 #[inline]
-pub fn hash_part(h: u64) -> u16 {
-    (h >> (64 - GROUP_BITS)) as u16
+pub fn hash_part(h: u64) -> usize {
+    (h >> (64 - GROUP_BITS)) as usize
 }
 
-/// Stable partitioning of rows 0..part.len() by part[i] in 0..nparts (nparts =
-/// dropped): recs[off[p]..off[p + 1]] are record(i) for the rows i of
-/// partition p, in row order. T must be valid when all-zero.
-pub fn scatter<T, R>(part: &[u16], nparts: usize, record: R) -> (Vec<T>, Vec<usize>)
-where
-    T: Copy + Send + Sync,
-    R: Fn(usize) -> T + Sync,
-{
-    let n = part.len();
-    let nch = n.div_ceil(1 << 16).max(1);
-    let size = n.div_ceil(nch).max(1);
-    let width = nparts + 1;
-    let mut hist = vec![0usize; nch * width];
-    hist.par_chunks_mut(width).zip(part.par_chunks(size)).for_each(|(h, rows)| {
-        for &p in rows {
-            h[p as usize] += 1;
-        }
-    });
-    let mut off = vec![0usize; nparts + 2];
-    let mut run = 0;
-    for p in 0..width {
-        off[p] = run;
-        for c in 0..nch {
-            let k = hist[c * width + p];
-            hist[c * width + p] = run;
-            run += k;
-        }
+/// One thread's records, by partition.
+pub type Buckets<T> = Vec<Vec<T>>;
+
+pub fn buckets<T>(parts: usize) -> Buckets<T> {
+    (0..parts).map(|_| Vec::new()).collect()
+}
+
+/// Buckets sized for about `total` records spread over every thread's buckets,
+/// so they rarely need to grow.
+pub fn buckets_for<T>(parts: usize, total: usize) -> Buckets<T> {
+    let each = total / (parts * rayon::current_num_threads()) * 5 / 4 + 16;
+    (0..parts).map(|_| Vec::with_capacity(each)).collect()
+}
+
+/// One value per worker thread of the rayon pool, which only that thread
+/// touches: a thread's records go to its own buckets without any locking.
+pub struct PerThread<T> {
+    cells: Vec<std::cell::UnsafeCell<T>>,
+}
+
+// Each cell is only ever used by one thread: the worker whose index it has, or main.
+unsafe impl<T: Send> Sync for PerThread<T> {}
+
+impl<T> PerThread<T> {
+    /// One value per worker, plus one for the main thread: a parallel loop over
+    /// a single item (a tiny input) runs on the calling thread, not in the pool.
+    pub fn new(make: impl Fn() -> T) -> PerThread<T> {
+        PerThread { cells: (0..=rayon::current_num_threads()).map(|_| std::cell::UnsafeCell::new(make())).collect() }
     }
-    off[width] = run;
-    let mut recs: Vec<T> = zeroed(off[nparts]);
-    let out = Out::new(&mut recs);
-    hist.par_chunks_mut(width).zip(part.par_chunks(size)).enumerate().for_each(|(c, (pos, rows))| {
-        for (i, &p) in rows.iter().enumerate() {
-            if (p as usize) < nparts {
-                unsafe { out.set(pos[p as usize], record(c * size + i)) };
-                pos[p as usize] += 1;
+
+    /// f on the calling thread's value. Must be called from a pool worker or
+    /// the main thread, and f must not start more parallel work (which could
+    /// run another task on this thread while f holds its value).
+    pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let i = rayon::current_thread_index().unwrap_or(self.cells.len() - 1);
+        f(unsafe { &mut *self.cells[i].get() })
+    }
+
+    pub fn into_inner(self) -> Vec<T> {
+        self.cells.into_iter().map(std::cell::UnsafeCell::into_inner).collect()
+    }
+}
+
+/// Every thread's buckets regrouped by partition: [partition][thread].
+pub fn by_partition<T>(threads: Vec<Buckets<T>>, parts: usize) -> Vec<Vec<Vec<T>>> {
+    let mut out: Vec<Vec<Vec<T>>> = (0..parts).map(|_| Vec::with_capacity(threads.len())).collect();
+    for b in threads {
+        for (p, v) in b.into_iter().enumerate() {
+            if !v.is_empty() {
+                out[p].push(v);
             }
         }
-    });
-    (recs, off)
-}
-
-/// Groups of equal strings among records partitioned by hash_part.
-pub struct Groups {
-    /// The group of each record: gid[j] is the group of recs[j].
-    pub gid: Vec<u32>,
-    /// The position in recs of each group's first record.
-    pub rep: Vec<u32>,
-    /// Partition p's groups are goff[p]..goff[p + 1].
-    pub goff: Vec<usize>,
-}
-
-/// Group records whose strings are equal: hash(r) is the string's hash, and
-/// same(a, b) tells, for two records with equal hashes, whether the strings are
-/// equal.
-pub fn group<T, H, S>(recs: &[T], off: &[usize], hash: H, same: S) -> Groups
-where
-    T: Sync,
-    H: Fn(&T) -> u64 + Sync,
-    S: Fn(&T, &T) -> bool + Sync,
-{
-    let nparts = off.len() - 2;
-    let mut gid = vec![0u32; recs.len()];
-    let out = Out::new(&mut gid);
-    let firsts: Vec<Vec<u32>> = (0..nparts)
-        .into_par_iter()
-        .map(|p| {
-            let part = &recs[off[p]..off[p + 1]];
-            let size = (2 * part.len()).next_power_of_two().max(2);
-            let mask = size - 1;
-            let mut table = vec![u32::MAX; size]; // slot -> local group
-            let mut first: Vec<u32> = Vec::new(); // local position of each group's first record
-            let mut hashes: Vec<u64> = Vec::new(); // and its hash
-            for (j, r) in part.iter().enumerate() {
-                let h = hash(r);
-                let mut slot = h as usize & mask;
-                let g = loop {
-                    let g = table[slot];
-                    if g == u32::MAX {
-                        table[slot] = first.len() as u32;
-                        first.push(j as u32);
-                        hashes.push(h);
-                        break table[slot];
-                    }
-                    if hashes[g as usize] == h && same(&part[first[g as usize] as usize], r) {
-                        break g;
-                    }
-                    slot = (slot + 1) & mask;
-                };
-                unsafe { out.set(off[p] + j, g) };
-            }
-            first.iter().map(|&f| (off[p] + f as usize) as u32).collect()
-        })
-        .collect();
-    let mut goff = vec![0usize; nparts + 1];
-    for p in 0..nparts {
-        goff[p + 1] = goff[p] + firsts[p].len();
     }
-    let out = Out::new(&mut gid);
-    (0..nparts).into_par_iter().for_each(|p| {
-        for j in off[p]..off[p + 1] {
-            unsafe { *out.at(j) += goff[p] as u32 };
+    out
+}
+
+/// An open-addressing hash table from strings to small group numbers, for one
+/// partition. It is sized for `cap` strings up front and never grows.
+pub struct LocalTable {
+    slots: Vec<u32>,
+    hashes: Vec<u64>,
+    mask: usize,
+}
+
+impl LocalTable {
+    pub fn new(cap: usize) -> LocalTable {
+        let size = (2 * cap).next_power_of_two().max(16);
+        LocalTable { slots: vec![u32::MAX; size], hashes: Vec::with_capacity(cap), mask: size - 1 }
+    }
+
+    /// The group of a string with hash h: an existing group g with the same
+    /// hash for which same(g) holds, or else a new group. Returns (group, is_new);
+    /// groups are numbered 0, 1, ... in order of first appearance.
+    #[inline]
+    pub fn get(&mut self, h: u64, same: impl Fn(u32) -> bool) -> (u32, bool) {
+        let mut slot = h as usize & self.mask;
+        loop {
+            let g = self.slots[slot];
+            if g == u32::MAX {
+                let g = self.hashes.len() as u32;
+                self.slots[slot] = g;
+                self.hashes.push(h);
+                return (g, true);
+            }
+            if self.hashes[g as usize] == h && same(g) {
+                return (g, false);
+            }
+            slot = (slot + 1) & self.mask;
         }
-    });
-    Groups { gid, rep: firsts.concat(), goff }
+    }
 }

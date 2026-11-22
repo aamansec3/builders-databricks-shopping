@@ -3,25 +3,29 @@
 //! Reads  $DATA_DIR   (default /data)
 //! Writes $OUTPUT_DIR (default /output): user_daily/ and campaign_daily/ as Parquet
 //!
-//! Stages, each parallel over rows or partitions:
-//!   parse     every line of every file, mapped not copied, into typed rows
-//!   events    dedup on event_id (earliest ingest_ts), then validate the kept copy
-//!   people    number every user ID, union-find over the links
-//!   sessions  per person: sessions, user_daily rows, click credit and assists
-//!   write     two Parquet files
+//! Each stage hands its records straight to the partition the next stage works
+//! on, so every row is written about once per stage:
+//!   parse     each line of every file (mapped, not copied); event copies go to
+//!             their event_id's hash partition, clicks to their user_id's
+//!   events    per event_id partition: keep the earliest copy, validate it, and
+//!             send it to its user_id's hash partition
+//!   users     per user_id partition: number the IDs of events, clicks and links
+//!   people    union-find over the links
+//!   sessions  per person partition: sessions, user_daily rows, credit and assists
+//!   write     the Parquet files
 
 mod group;
 mod output;
 mod parse;
 mod sessions;
 
-use group::{GROUP_PARTS, group, hash_part, scatter};
+use group::{Buckets, GROUP_PARTS, LocalTable, PerThread, buckets, buckets_for, by_partition, hash_part};
 use output::Column;
 use parquet::data_type::ByteArray;
-use parse::{DAY, Input, NULL, Out, bytes, digits, fields, hash, ts, zeroed};
+use parse::{DAY, Input, NULL, bytes, digits, fields, hash, ts};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use sessions::WEEK;
+use sessions::{SessClick, SessEvent, WEEK};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -30,83 +34,92 @@ const VIEW: u8 = 1;
 const CART: u8 = 2;
 const PURCHASE: u8 = 3;
 
+/// A user ID: its hash, its first 16 bytes packed into two words (with the
+/// length, that identifies an ID of up to 16 bytes exactly, without reading the
+/// input again), and where it is in the input.
 #[derive(Clone, Copy, Default)]
-struct Link {
-    a: u64,
-    b: u64,
-    a_n: u32,
-    b_n: u32,
-    ok: bool,
-}
-
-/// One copy of an event. ok when well-formed with a non-empty event_id; the
-/// other field rules are checked on the kept copy, after dedup. price is -1
-/// unless it's a purchase whose price is digits only with at most 8 significant
-/// digits. cat is the product's category (unknown when not in products.csv), or
-/// -1 when product_id is empty: only the category is ever needed, not the ID.
-#[derive(Clone, Copy, Default)]
-struct Event {
-    eid: u64,
-    uid: u64,
-    hash: u64,
-    ts: i64,
-    ingest: i64,
-    eid_n: u32,
-    uid_n: u32,
-    price: i32,
-    cat: i16,
-    typ: u8,
-    ok: bool,
-}
-
-/// One click. ok when it's valid: well-formed, non-empty click_id and user_id,
-/// ts in the click window, campaign in campaigns.csv. Copies of a click are
-/// identical, so they aren't deduped: a copy can't change which campaign a
-/// session credits, or the set of campaigns that assist it.
-#[derive(Clone, Copy, Default)]
-struct Click {
-    cid: u64,
-    uid: u64,
-    ts: i64,
-    cid_n: u32,
-    uid_n: u32,
-    camp: u32,
-    ok: bool,
-}
-
-/// One copy of an event, in its hash partition.
-#[derive(Clone, Copy)]
-struct EventCopy {
-    hash: u64,
-    ingest: i64,
-    row: u32,
-}
-
-/// A user ID in its hash partition: up to 16 bytes of it packed in w0, w1.
-#[derive(Clone, Copy)]
-struct UserId {
+struct UserKey {
     hash: u64,
     w0: u64,
     w1: u64,
-    item: u32,
-    n: u32,
-}
-
-/// The first 16 bytes of b, zero-padded, as two words. With the length, this
-/// identifies a string of up to 16 bytes exactly.
-#[inline]
-fn pack(b: &[u8]) -> (u64, u64) {
-    let mut t = [0u8; 16];
-    let k = b.len().min(16);
-    t[..k].copy_from_slice(&b[..k]);
-    (u64::from_le_bytes(t[..8].try_into().unwrap()), u64::from_le_bytes(t[8..].try_into().unwrap()))
-}
-
-/// A user ID to number, from a link, a kept event or a valid click.
-#[derive(Clone, Copy)]
-struct Item {
     p: u64,
     n: u32,
+}
+
+impl UserKey {
+    fn of(b: &[u8]) -> UserKey {
+        let mut t = [0u8; 16];
+        let k = b.len().min(16);
+        t[..k].copy_from_slice(&b[..k]);
+        UserKey {
+            hash: hash(b),
+            w0: u64::from_le_bytes(t[..8].try_into().unwrap()),
+            w1: u64::from_le_bytes(t[8..].try_into().unwrap()),
+            p: b.as_ptr() as u64,
+            n: b.len() as u32,
+        }
+    }
+    fn bytes(&self) -> &'static [u8] {
+        bytes(self.p, self.n)
+    }
+    /// Whether two IDs with equal hashes are the same ID.
+    fn same(&self, o: &UserKey) -> bool {
+        self.n == o.n && self.w0 == o.w0 && self.w1 == o.w1 && (self.n <= 16 || self.bytes() == o.bytes())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Link {
+    a: UserKey,
+    b: UserKey,
+    ok: bool,
+}
+
+/// One copy of an event, in its event_id's hash partition. valid holds every
+/// field rule and the late rule; it only matters for the copy dedup keeps
+/// (a later valid copy doesn't rescue an invalid kept one).
+#[derive(Clone, Copy)]
+struct EventCopy {
+    eid: u64,
+    eid_hash: u64,
+    ingest: i64,
+    ts: i64,
+    /// price << 16 | category << 1 | is_purchase
+    pay: i64,
+    user: UserKey,
+    eid_n: u32,
+    valid: bool,
+}
+
+/// A kept, valid event in its user_id's hash partition; gid is its user ID's
+/// number within the partition.
+#[derive(Clone, Copy)]
+struct Kept {
+    user: UserKey,
+    ts: i64,
+    pay: i64,
+    gid: u32,
+}
+
+/// A valid click in its user_id's hash partition. Copies of a click are
+/// identical, so they aren't deduped: a copy can't change which campaign a
+/// session credits, or the set of campaigns that assist it.
+#[derive(Clone, Copy)]
+struct ClickRec {
+    user: UserKey,
+    ts: i64,
+    cid: u64,
+    cid_n: u32,
+    camp: u32,
+    gid: u32,
+}
+
+/// One side (2j or 2j + 1) of link j, in its user_id's hash partition.
+#[derive(Clone, Copy)]
+struct LinkSide {
+    user: UserKey,
+    side: u32,
+    gid: u32,
 }
 
 /// The value of "key": "..." in a flat JSON object.
@@ -199,7 +212,7 @@ fn main() {
     let li = Input::open(&data.join("links"));
     let ei = Input::open(&data.join("events"));
     let ci = Input::open(&data.join("clicks"));
-    let (links, events, clicks) = std::thread::scope(|sc| {
+    let (links, copies, clicks) = std::thread::scope(|sc| {
         sc.spawn(|| {
             li.prefetch();
             ei.prefetch();
@@ -210,170 +223,165 @@ fn main() {
             if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 || fb[1].1 == fb[1].0 {
                 return Link::default();
             }
-            let (a, b) = (&line[fb[0].0..fb[0].1], &line[fb[1].0..fb[1].1]);
-            Link { a: a.as_ptr() as u64, b: b.as_ptr() as u64, a_n: a.len() as u32, b_n: b.len() as u32, ok: true }
+            Link { a: UserKey::of(&line[fb[0].0..fb[0].1]), b: UserKey::of(&line[fb[1].0..fb[1].1]), ok: true }
         });
-        log("parsed links".into());
+        log(format!("parsed links: {}", links.len()));
 
-        let events: Vec<Event> = ei.parse(|line, header| {
-            let mut fb = [(0, 0); 7];
-            if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 {
-                return Event::default();
-            }
-            let f = |k: usize| &line[fb[k].0..fb[k].1];
-            let (eid, uid, pid) = (f(0), f(1), f(5));
-            let typ = match f(4) {
-                b"view" => VIEW,
-                b"cart" => CART,
-                b"purchase" => PURCHASE,
-                _ => 0,
-            };
-            Event {
-                eid: eid.as_ptr() as u64,
-                uid: uid.as_ptr() as u64,
-                hash: hash(eid),
-                ts: ts(f(2)),
-                ingest: ts(f(3)),
-                eid_n: eid.len() as u32,
-                uid_n: uid.len() as u32,
-                price: if typ == PURCHASE { digits(f(6), 8) as i32 } else { -1 },
-                cat: if pid.is_empty() { -1 } else { *product_cat.get(pid).unwrap_or(&unknown) },
-                typ,
-                ok: true,
-            }
+        // An events line is ~95 bytes, a clicks line ~50.
+        let copies: PerThread<Buckets<EventCopy>> = PerThread::new(|| buckets_for(GROUP_PARTS, ei.bytes / 90));
+        ei.for_each_line(&copies, |acc, line, header| {
+                let mut fb = [(0, 0); 7];
+                if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 {
+                    return; // malformed: never the kept copy
+                }
+                let f = |k: usize| &line[fb[k].0..fb[k].1];
+                let (eid, uid, pid) = (f(0), f(1), f(5));
+                let typ = match f(4) {
+                    b"view" => VIEW,
+                    b"cart" => CART,
+                    b"purchase" => PURCHASE,
+                    _ => 0,
+                };
+                let (t, ingest) = (ts(f(2)), ts(f(3)));
+                let price = if typ == PURCHASE { digits(f(6), 8) } else { -1 };
+                let cat = if pid.is_empty() { -1 } else { *product_cat.get(pid).unwrap_or(&unknown) as i64 };
+                let valid = !uid.is_empty()
+                    && cat >= 0
+                    && typ != 0
+                    && t >= ws
+                    && t < we
+                    && (typ != PURCHASE || (1..=10_000_000).contains(&price))
+                    && ingest != NULL
+                    && ingest - t <= DAY;
+                let h = hash(eid);
+                acc[hash_part(h)].push(EventCopy {
+                    eid: eid.as_ptr() as u64,
+                    eid_hash: h,
+                    ingest,
+                    ts: t,
+                    pay: if typ == PURCHASE { (price << 16) | (cat << 1) | 1 } else { cat << 1 },
+                    user: if valid { UserKey::of(uid) } else { UserKey::default() },
+                    eid_n: eid.len() as u32,
+                    valid,
+                });
         });
         log("parsed events".into());
 
-        let clicks: Vec<Click> = ci.parse(|line, header| {
-            let mut fb = [(0, 0); 4];
-            if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 || fb[1].1 == fb[1].0 {
-                return Click::default();
-            }
-            let f = |k: usize| &line[fb[k].0..fb[k].1];
-            let t = ts(f(3));
-            if t < ws - WEEK || t >= we {
-                return Click::default();
-            }
-            let Some(&camp) = campaign_index.get(f(2)) else { return Click::default() };
-            let (cid, uid) = (f(0), f(1));
-            Click {
-                cid: cid.as_ptr() as u64,
-                uid: uid.as_ptr() as u64,
-                ts: t,
-                cid_n: cid.len() as u32,
-                uid_n: uid.len() as u32,
-                camp,
-                ok: true,
-            }
+        let clicks: PerThread<Buckets<ClickRec>> = PerThread::new(|| buckets_for(GROUP_PARTS, ci.bytes / 48));
+        ci.for_each_line(&clicks, |acc, line, header| {
+                let mut fb = [(0, 0); 4];
+                if header || !fields(line, &mut fb) || fb[0].1 == fb[0].0 || fb[1].1 == fb[1].0 {
+                    return;
+                }
+                let f = |k: usize| &line[fb[k].0..fb[k].1];
+                let t = ts(f(3));
+                if t < ws - WEEK || t >= we {
+                    return;
+                }
+                let Some(&camp) = campaign_index.get(f(2)) else { return };
+                let (cid, user) = (f(0), UserKey::of(f(1)));
+                acc[hash_part(user.hash)].push(ClickRec {
+                    user,
+                    ts: t,
+                    cid: cid.as_ptr() as u64,
+                    cid_n: cid.len() as u32,
+                    camp,
+                    gid: 0,
+                });
         });
-        (links, events, clicks)
+        (links, by_partition(copies.into_inner(), GROUP_PARTS), by_partition(clicks.into_inner(), GROUP_PARTS))
     });
-    log(format!(
-        "parsed clicks ({} MB in all: {} link, {} event, {} click lines)",
-        (li.bytes + ei.bytes + ci.bytes) >> 20,
-        links.len(),
-        events.len(),
-        clicks.len()
-    ));
+    log(format!("parsed clicks ({} MB in all)", (li.bytes + ei.bytes + ci.bytes) >> 20));
 
-    // --- Events: keep the earliest copy of each event_id, then validate it
-    let part: Vec<u16> =
-        events.par_iter().map(|e| if e.ok { hash_part(e.hash) } else { GROUP_PARTS as u16 }).collect();
-    let (copies, off) = scatter(&part, GROUP_PARTS, |i| {
-        let e = &events[i];
-        EventCopy { hash: e.hash, ingest: e.ingest, row: i as u32 }
-    });
-    drop(part);
-    let g = group(&copies, &off, |c| c.hash, |a, b| {
-        let (x, y) = (&events[a.row as usize], &events[b.row as usize]);
-        bytes(x.eid, x.eid_n) == bytes(y.eid, y.eid_n)
-    });
-    let mut chosen = vec![false; events.len()];
-    let o = Out::new(&mut chosen);
-    (0..GROUP_PARTS).into_par_iter().for_each(|p| {
-        // The copy with the smallest ingest_ts. Copies with equal ingest_ts are
-        // identical, so any of them will do; a bad ingest_ts never wins.
-        let g0 = g.goff[p];
-        let mut best = vec![(u32::MAX, i64::MAX); g.goff[p + 1] - g0];
-        for j in off[p]..off[p + 1] {
-            let c = &copies[j];
-            let key = if c.ingest == NULL { i64::MAX } else { c.ingest };
-            let b = &mut best[g.gid[j] as usize - g0];
-            if b.0 == u32::MAX || key < b.1 {
-                *b = (c.row, key);
-            }
-        }
-        for (r, _) in best {
-            unsafe { o.set(r as usize, true) };
-        }
-    });
-    drop((copies, off, g));
-    log("events deduped".into());
-    let keep: Vec<bool> = events
-        .par_iter()
-        .zip(&chosen)
-        .map(|(e, &c)| {
-            c && e.uid_n > 0
-                && e.cat >= 0
-                && e.typ != 0
-                && e.ts >= ws
-                && e.ts < we
-                && (e.typ != PURCHASE || (1..=10_000_000).contains(&e.price))
-                && e.ingest != NULL
-                && e.ingest - e.ts <= DAY
+    // --- Events: per event_id partition, keep the earliest copy of each event
+    // (copies with equal ingest_ts are identical, so any will do; a bad
+    // ingest_ts never wins), and send it on if it is valid.
+    let ncopies: usize = copies.iter().flatten().map(Vec::len).sum();
+    let kept: PerThread<Buckets<Kept>> = PerThread::new(|| buckets_for(GROUP_PARTS, ncopies));
+    copies.into_par_iter().for_each(|lists| {
+        kept.with(|acc| {
+                let n = lists.iter().map(Vec::len).sum();
+                let mut table = LocalTable::new(n);
+                let mut best: Vec<&EventCopy> = Vec::with_capacity(n);
+                for c in lists.iter().flatten() {
+                    let (g, new) = table.get(c.eid_hash, |g| {
+                        let b = best[g as usize];
+                        b.eid_n == c.eid_n && bytes(b.eid, b.eid_n) == bytes(c.eid, c.eid_n)
+                    });
+                    let key = |e: &EventCopy| if e.ingest == NULL { i64::MAX } else { e.ingest };
+                    if new {
+                        best.push(c);
+                    } else if key(c) < key(best[g as usize]) {
+                        best[g as usize] = c;
+                    }
+                }
+                for e in best.into_iter().filter(|e| e.valid) {
+                    acc[hash_part(e.user.hash)].push(Kept { user: e.user, ts: e.ts, pay: e.pay, gid: 0 });
+                }
         })
-        .collect();
-    drop(chosen);
-    log("events validated".into());
+    });
+    let kept = by_partition(kept.into_inner(), GROUP_PARTS);
+    log("events deduped, validated".into());
 
-    // --- People: number every user ID (both sides of each link, then each
-    // kept event, then each valid click), then join linked ones.
-    let (nl, ne, nc) = (links.len(), events.len(), clicks.len());
-    let m = 2 * nl + ne + nc;
-    let mut items: Vec<Item> = zeroed(m);
-    let mut ih: Vec<u64> = zeroed(m);
-    let mut part: Vec<u16> = zeroed(m);
-    let (oi, oh, op) = (Out::new(&mut items), Out::new(&mut ih), Out::new(&mut part));
-    let put = |i: usize, p: u64, n: u32, used: bool| unsafe {
-        if used {
-            let h = hash(bytes(p, n));
-            oi.set(i, Item { p, n });
-            oh.set(i, h);
-            op.set(i, hash_part(h));
-        } else {
-            op.set(i, GROUP_PARTS as u16);
+    // --- Users: per user_id partition, number the IDs of kept events, valid
+    // clicks and both sides of each link. A user is goff[p] + its number in p.
+    let mut sides: Buckets<LinkSide> = buckets(GROUP_PARTS);
+    for (j, l) in links.iter().enumerate().filter(|(_, l)| l.ok) {
+        for (s, user) in [(2 * j, l.a), (2 * j + 1, l.b)] {
+            sides[hash_part(user.hash)].push(LinkSide { user, side: s as u32, gid: 0 });
         }
-    };
-    links.par_iter().enumerate().for_each(|(j, l)| {
-        put(2 * j, l.a, l.a_n, l.ok);
-        put(2 * j + 1, l.b, l.b_n, l.ok);
+    }
+    struct UserPart {
+        kept: Vec<Vec<Kept>>,
+        clicks: Vec<Vec<ClickRec>>,
+        sides: Vec<LinkSide>,
+        ids: Vec<UserKey>,
+    }
+    let mut parts: Vec<UserPart> = kept
+        .into_iter()
+        .zip(clicks)
+        .zip(sides)
+        .map(|((kept, clicks), sides)| UserPart { kept, clicks, sides, ids: Vec::new() })
+        .collect();
+    parts.par_iter_mut().for_each(|part| {
+        let n = part.kept.iter().map(Vec::len).sum::<usize>()
+            + part.clicks.iter().map(Vec::len).sum::<usize>()
+            + part.sides.len();
+        let mut table = LocalTable::new(n);
+        let ids = &mut part.ids;
+        let mut number = |user: &UserKey| {
+            let (g, new) = table.get(user.hash, |g| ids[g as usize].same(user));
+            if new {
+                ids.push(*user);
+            }
+            g
+        };
+        for k in part.kept.iter_mut().flatten() {
+            k.gid = number(&k.user);
+        }
+        for c in part.clicks.iter_mut().flatten() {
+            c.gid = number(&c.user);
+        }
+        for s in part.sides.iter_mut() {
+            s.gid = number(&s.user);
+        }
     });
-    events.par_iter().zip(&keep).enumerate().for_each(|(j, (e, &k))| put(2 * nl + j, e.uid, e.uid_n, k));
-    clicks.par_iter().enumerate().for_each(|(j, c)| put(2 * nl + ne + j, c.uid, c.uid_n, c.ok));
-    log("user IDs hashed".into());
-    let item_str = |i: u32| {
-        let it = &items[i as usize];
-        bytes(it.p, it.n)
-    };
-    // An ID of up to 16 bytes is held whole in the record (w0, w1, n), so two
-    // of them compare without reading the input again; longer ones compare bytes.
-    let (ids, off) = scatter(&part, GROUP_PARTS, |i| {
-        let it = &items[i];
-        let (w0, w1) = pack(bytes(it.p, it.n));
-        UserId { hash: ih[i], w0, w1, item: i as u32, n: it.n }
-    });
-    drop((part, ih));
-    let g = group(&ids, &off, |u| u.hash, |a, b| {
-        a.n == b.n && a.w0 == b.w0 && a.w1 == b.w1 && (a.n <= 16 || item_str(a.item) == item_str(b.item))
-    });
-    let mut ugid: Vec<u32> = zeroed(m); // only read for items in use
-    let o = Out::new(&mut ugid);
-    ids.par_iter().zip(&g.gid).for_each(|(u, &gi)| unsafe { o.set(u.item as usize, gi) });
-    let rep: Vec<u32> = g.rep.iter().map(|&j| ids[j as usize].item).collect();
-    drop((ids, off, g));
-    let users = rep.len();
-    log(format!("user IDs grouped: {users}"));
-    // Union-find over the links; a person is named by their byte-wise smallest ID.
+    let mut goff = vec![0u32; GROUP_PARTS + 1];
+    for p in 0..GROUP_PARTS {
+        goff[p + 1] = goff[p] + parts[p].ids.len() as u32;
+    }
+    let users = goff[GROUP_PARTS] as usize;
+    let user_keys: Vec<UserKey> = parts.iter_mut().flat_map(|p| std::mem::take(&mut p.ids)).collect();
+    let mut side_user = vec![0u32; 2 * links.len()];
+    for (p, part) in parts.iter().enumerate() {
+        for s in &part.sides {
+            side_user[s.side as usize] = goff[p] + s.gid;
+        }
+    }
+    log(format!("user IDs numbered: {users}"));
+
+    // --- People: union-find over the links; a person is named by their
+    // byte-wise smallest ID.
     let mut parent: Vec<u32> = (0..users as u32).collect();
     fn root(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
@@ -384,8 +392,8 @@ fn main() {
     }
     for (j, l) in links.iter().enumerate() {
         if l.ok {
-            let a = root(&mut parent, ugid[2 * j]);
-            let b = root(&mut parent, ugid[2 * j + 1]);
+            let a = root(&mut parent, side_user[2 * j]);
+            let b = root(&mut parent, side_user[2 * j + 1]);
             if a < b {
                 parent[b as usize] = a;
             } else if b < a {
@@ -395,49 +403,44 @@ fn main() {
     }
     let person: Vec<u32> = (0..users as u32).map(|u| root(&mut parent, u)).collect();
     drop(parent);
-    let mut name = rep.clone();
+    let mut name: Vec<u32> = (0..users as u32).collect();
     for u in 0..users {
         let r = person[u] as usize;
-        if r != u && item_str(rep[u]) < item_str(name[r]) {
-            name[r] = rep[u];
+        if r != u && user_keys[u].bytes() < user_keys[name[r] as usize].bytes() {
+            name[r] = u as u32;
         }
     }
     log("people joined (union-find)".into());
 
-    // --- Sessions, credit, assists
-    // Sort keys are person << shift | (ts - earliest ts), and persons < users.
+    // --- Sessions, credit, assists: each user_id partition sends its events and
+    // clicks, keyed by person, to the person's partition.
     let eshift = bits(we - ws);
     let cshift = bits(we - ws + WEEK);
     assert!(bits(users as i64) + cshift <= 62, "window too long for the sort keys");
-    let person_of = |item: usize| person[ugid[item] as usize] as i64;
-    let epart: Vec<u16> = (0..ne)
-        .into_par_iter()
-        .map(|j| if keep[j] { (person_of(2 * nl + j) as usize % PERSON_PARTS) as u16 } else { PERSON_PARTS as u16 })
-        .collect();
-    let (mut erecs, eoff) = scatter(&epart, PERSON_PARTS, |j| {
-        let e = &events[j];
-        let pay = if e.typ == PURCHASE { ((e.price as i64) << 16) | ((e.cat as i64) << 1) | 1 } else { (e.cat as i64) << 1 };
-        ((person_of(2 * nl + j) << eshift) | (e.ts - ws), pay)
-    });
-    let cpart: Vec<u16> = (0..nc)
-        .into_par_iter()
-        .map(|j| {
-            if clicks[j].ok { (person_of(2 * nl + ne + j) as usize % PERSON_PARTS) as u16 } else { PERSON_PARTS as u16 }
+    let nkept: usize = parts.iter().map(|p| p.kept.iter().map(Vec::len).sum::<usize>()).sum();
+    let nclicks: usize = parts.iter().map(|p| p.clicks.iter().map(Vec::len).sum::<usize>()).sum();
+    #[allow(clippy::type_complexity)]
+    let to_people: PerThread<(Buckets<SessEvent>, Buckets<SessClick>)> =
+        PerThread::new(|| (buckets_for(PERSON_PARTS, nkept), buckets_for(PERSON_PARTS, nclicks)));
+    parts.par_iter().enumerate().for_each(|(p, part)| {
+        to_people.with(|(ev, cl)| {
+                for k in part.kept.iter().flatten() {
+                    let who = person[(goff[p] + k.gid) as usize] as i64;
+                    ev[who as usize % PERSON_PARTS].push(((who << eshift) | (k.ts - ws), k.pay));
+                }
+                for c in part.clicks.iter().flatten() {
+                    let who = person[(goff[p] + c.gid) as usize] as i64;
+                    cl[who as usize % PERSON_PARTS].push(((who << cshift) | (c.ts - (ws - WEEK)), c.camp, c.cid_n, c.cid));
+                }
         })
-        .collect();
-    let (mut crecs, coff) = scatter(&cpart, PERSON_PARTS, |j| {
-        let c = &clicks[j];
-        ((person_of(2 * nl + ne + j) << cshift) | (c.ts - (ws - WEEK)), c.camp, j as u32)
     });
-    drop((epart, cpart, ugid));
-    log("sort keys built".into());
+    let (ev, cl): (Vec<_>, Vec<_>) = to_people.into_inner().into_iter().unzip();
+    drop(parts);
+    log("records sent to person partitions".into());
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let inp = sessions::Input { eshift, cshift, ws, ncat: categories.len(), ncamp, day0, ndays };
-    let (rows, acc) = sessions::run(&inp, &mut erecs, &eoff, &mut crecs, &coff, |r| {
-        let c = &clicks[r as usize];
-        bytes(c.cid, c.cid_n)
-    });
+    let (rows, acc) = sessions::run(&inp, by_partition(ev, PERSON_PARTS), by_partition(cl, PERSON_PARTS));
     log(format!("sessions, credit, assists: {} user_daily rows", rows.len()));
 
     // --- Outputs
@@ -453,7 +456,7 @@ fn main() {
         let per = rows.len().div_ceil(ncpu).max(1);
         let parts: Vec<&[sessions::UserDay]> = if rows.is_empty() { vec![&rows[..]] } else { rows.chunks(per).collect() };
         parts.into_par_iter().enumerate().for_each(|(i, rows)| {
-            let user_id = rows.iter().map(|r| ByteArray::from(item_str(name[r.person as usize]).to_vec())).collect();
+            let user_id = rows.iter().map(|r| ByteArray::from(user_keys[name[r.person as usize] as usize].bytes().to_vec())).collect();
             let present: Vec<i16> = rows.iter().map(|r| i16::from(r.top >= 0)).collect();
             let top =
                 rows.iter().filter(|r| r.top >= 0).map(|r| ByteArray::from(categories[r.top as usize].to_vec())).collect();

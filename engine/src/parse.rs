@@ -24,12 +24,7 @@ impl<T> Out<T> {
     pub fn new(v: &mut [T]) -> Self {
         Out(v.as_mut_ptr())
     }
-    /// Safety: i is in bounds and no other task writes index i.
-    #[inline]
-    pub unsafe fn set(self, i: usize, x: T) {
-        unsafe { *self.0.add(i) = x }
-    }
-    /// Safety: as for set.
+    /// Safety: i is in bounds and no other task touches index i.
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn at<'a>(self, i: usize) -> &'a mut T {
@@ -88,8 +83,90 @@ pub fn hash(b: &[u8]) -> u64 {
 
 /// Split a line into fields; fb[f] = [start, end) of field f, quotes excluded.
 /// True when the line has exactly nf fields and every quote wraps a whole field.
+///
+/// Lines of up to 128 bytes (all but freak ones) first mark every comma and
+/// quote in the line, 16 bytes at a time, as bits of a 128-bit mask; then each
+/// field is found by jumping to the next marked byte, not by testing each byte.
 #[inline]
 pub fn fields(line: &[u8], fb: &mut [(usize, usize)]) -> bool {
+    if line.len() > 128 {
+        return fields_bytewise(line, fb);
+    }
+    let (special, quote) = marks(line);
+    let nf = fb.len();
+    let e = line.len();
+    // The first comma or quote at or after x, or e. (Bits past e are never set.)
+    let next = |x: usize| -> usize {
+        let m = if x >= 128 { 0 } else { special >> x };
+        if m == 0 { e } else { x + m.trailing_zeros() as usize }
+    };
+    let is_quote = |x: usize| (quote >> x) & 1 == 1;
+    let mut p = 0;
+    let mut k = 0;
+    loop {
+        let (cs, ce);
+        if p < e && is_quote(p) {
+            let q = next(p + 1);
+            if q >= e || !is_quote(q) {
+                return false;
+            }
+            cs = p + 1;
+            ce = q;
+            p = q + 1;
+        } else {
+            let q = next(p);
+            if q < e && is_quote(q) {
+                return false;
+            }
+            cs = p;
+            ce = q;
+            p = q;
+        }
+        if k == nf {
+            return false;
+        }
+        fb[k] = (cs, ce);
+        k += 1;
+        if p == e {
+            return k == nf;
+        }
+        if line[p] != b',' {
+            return false;
+        }
+        p += 1;
+    }
+}
+
+/// Bit masks of the commas and quotes (special) and of the quotes alone in a
+/// line of up to 128 bytes: bit i is byte i.
+#[inline]
+fn marks(line: &[u8]) -> (u128, u128) {
+    let mut buf = [0u8; 128];
+    buf[..line.len()].copy_from_slice(line);
+    let (mut special, mut quote) = (0u128, 0u128);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        // SSE2: part of every x86-64 CPU.
+        let (comma_v, quote_v) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8));
+        for i in 0..line.len().div_ceil(16) {
+            let v = _mm_loadu_si128(buf.as_ptr().add(16 * i) as *const __m128i);
+            let q = _mm_movemask_epi8(_mm_cmpeq_epi8(v, quote_v)) as u32 as u128;
+            let c = _mm_movemask_epi8(_mm_cmpeq_epi8(v, comma_v)) as u32 as u128;
+            quote |= q << (16 * i);
+            special |= (q | c) << (16 * i);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for (i, &c) in line.iter().enumerate() {
+        quote |= u128::from(c == b'"') << i;
+        special |= u128::from(c == b'"' || c == b',') << i;
+    }
+    (special, quote)
+}
+
+/// fields, one byte at a time: for lines over 128 bytes.
+fn fields_bytewise(line: &[u8], fb: &mut [(usize, usize)]) -> bool {
     let nf = fb.len();
     let e = line.len();
     let mut p = 0;
@@ -138,15 +215,24 @@ pub fn fields(line: &[u8], fb: &mut [(usize, usize)]) -> bool {
 /// character, or has more than max_sig significant digits (leading zeros are fine).
 #[inline]
 pub fn digits(f: &[u8], max_sig: usize) -> i64 {
-    if f.is_empty() || !f.iter().all(|c| c.is_ascii_digit()) {
+    if f.is_empty() {
         return -1;
     }
-    let zeros = f.iter().take_while(|&&c| c == b'0').count();
-    let sig = &f[zeros..];
-    if sig.len() > max_sig {
-        return -1;
+    let (mut v, mut sig) = (0i64, 0usize);
+    for &c in f {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return -1;
+        }
+        if sig > 0 || d != 0 {
+            sig += 1;
+            if sig > max_sig {
+                return -1;
+            }
+            v = v * 10 + d as i64;
+        }
     }
-    sig.iter().fold(0i64, |v, &c| v * 10 + (c - b'0') as i64)
+    v
 }
 
 #[inline]
@@ -252,48 +338,65 @@ impl Input {
         }
     }
 
-    /// f(line, is_header) for every line of every file, in parallel over blocks;
-    /// line 0 of each file is its header. Each block starts as soon as a thread
+    /// The blocks to parse: (file, first byte).
+    fn blocks(&self) -> Vec<(usize, usize)> {
+        self.maps
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| (0..m.len()).step_by(BLOCK).map(move |b| (i, b)))
+            .collect()
+    }
+
+    /// f(line, is_header) for the lines that start in a block (line 0 of each
+    /// file is its header; the block's last line may run into the next one).
+    fn block_lines(&self, (i, b0): (usize, usize), mut f: impl FnMut(&[u8], bool)) {
+        let m = &self.maps[i][..];
+        let b1 = (b0 + BLOCK).min(m.len());
+        let first = if b0 == 0 { 0 } else { memchr::memchr(b'\n', &m[b0 - 1..]).map_or(m.len(), |k| b0 + k) };
+        let mut s = first;
+        for e in memchr::memchr_iter(b'\n', &m[first..]) {
+            if s >= b1 {
+                return;
+            }
+            let e = first + e;
+            f(&m[s..e], s == 0);
+            s = e + 1;
+        }
+        if s < b1 && s < m.len() {
+            f(&m[s..], s == 0); // a last line with no \n
+        }
+    }
+
+    /// f(line, is_header) for every line of every file, in parallel over
+    /// blocks, collected in file order. Each block starts as soon as a thread
     /// is free, so on a cold disk parsing overlaps with reading.
     pub fn parse<T, F>(&self, f: F) -> Vec<T>
     where
         T: Copy + Send + Sync,
         F: Fn(&[u8], bool) -> T + Sync,
     {
-        let blocks: Vec<(usize, usize)> = self
-            .maps
-            .iter()
-            .enumerate()
-            .flat_map(|(i, m)| (0..m.len()).step_by(BLOCK).map(move |b| (i, b)))
-            .collect();
-        let parts: Vec<Vec<T>> = blocks
-            .par_iter()
-            .map(|&(i, b0)| {
-                let m = &self.maps[i][..];
-                let b1 = (b0 + BLOCK).min(m.len());
-                // The first line that starts in [b0, b1).
-                let first = if b0 == 0 {
-                    0
-                } else {
-                    memchr::memchr(b'\n', &m[b0 - 1..]).map_or(m.len(), |k| b0 + k)
-                };
-                let mut out = Vec::with_capacity((b1 - b0) / 64 + 1);
-                let mut s = first;
-                for e in memchr::memchr_iter(b'\n', &m[first..]) {
-                    if s >= b1 {
-                        break;
-                    }
-                    let e = first + e;
-                    out.push(f(&m[s..e], s == 0));
-                    s = e + 1;
-                }
-                if s < b1 && s < m.len() {
-                    out.push(f(&m[s..], s == 0)); // a last line with no \n
-                }
+        let parts: Vec<Vec<T>> = self
+            .blocks()
+            .into_par_iter()
+            .map(|b| {
+                let mut out = Vec::new();
+                self.block_lines(b, |line, header| out.push(f(line, header)));
                 out
             })
             .collect();
         concat(&parts)
+    }
+
+    /// f(state, line, is_header) for every line of every file, in parallel
+    /// over blocks, where state is the calling thread's own.
+    pub fn for_each_line<A, F>(&self, state: &crate::group::PerThread<A>, f: F)
+    where
+        A: Send,
+        F: Fn(&mut A, &[u8], bool) + Sync + Send,
+    {
+        self.blocks().into_par_iter().for_each(|b| {
+            state.with(|s| self.block_lines(b, |line, header| f(s, line, header)));
+        });
     }
 }
 

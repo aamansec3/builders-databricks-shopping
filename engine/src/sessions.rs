@@ -9,7 +9,7 @@
 //! assists, and the window's latest click (smallest click_id on a ts tie) gets
 //! the credit; an empty window credits organic (campaign index ncamp).
 
-use crate::parse::DAY;
+use crate::parse::{DAY, bytes};
 use rayon::prelude::*;
 
 pub const GAP: i64 = 1_800_000;
@@ -51,10 +51,7 @@ impl Acc {
     }
 }
 
-/// Kept events as (key, pay) and valid clicks as (key, campaign, click row),
-/// partitioned by person. key is person << shift | (ts - its window start), so
-/// sorting keys sorts by (person, ts); pay is price << 16 | category << 1 |
-/// is_purchase.
+/// What the walk needs beyond the records themselves.
 pub struct Input {
     pub eshift: u32,
     pub cshift: u32,
@@ -65,36 +62,23 @@ pub struct Input {
     pub ndays: usize,
 }
 
-/// v split at off into the slices of partitions 0..off.len() - 2.
-fn split<'a, T>(mut v: &'a mut [T], off: &[usize]) -> Vec<&'a mut [T]> {
-    let mut parts = Vec::with_capacity(off.len() - 2);
-    for p in 0..off.len() - 2 {
-        let (a, b) = v.split_at_mut(off[p + 1] - off[p]);
-        parts.push(a);
-        v = b;
-    }
-    parts
-}
+/// A kept event: (key, pay). key is person << eshift | (ts - window start), so
+/// sorting keys sorts by (person, ts); pay is price << 16 | category << 1 | is_purchase.
+pub type SessEvent = (i64, i64);
+/// A valid click: (key, campaign, click_id length, click_id pointer), with key
+/// person << cshift | (ts - (window start - 7 days)).
+pub type SessClick = (i64, u32, u32, u64);
 
-#[allow(clippy::type_complexity)]
-pub fn run<'a, C>(
-    inp: &Input,
-    events: &mut [(i64, i64)],
-    eoff: &[usize],
-    clicks: &mut [(i64, u32, u32)],
-    coff: &[usize],
-    click_id: C,
-) -> (Vec<UserDay>, Acc)
-where
-    C: Fn(u32) -> &'a [u8] + Sync,
-{
-    split(events, eoff)
+/// Run every person partition: events[q] and clicks[q] are partition q's
+/// records, as one list per thread that produced them.
+pub fn run(inp: &Input, events: Vec<Vec<Vec<SessEvent>>>, clicks: Vec<Vec<Vec<SessClick>>>) -> (Vec<UserDay>, Acc) {
+    events
         .into_par_iter()
-        .zip(split(clicks, coff))
+        .zip(clicks)
         .fold(
             || (Vec::new(), Acc::new(inp.ncamp, inp.ndays)),
             |(mut rows, mut acc), (ev, cv)| {
-                partition(inp, &click_id, ev, cv, &mut rows, &mut acc);
+                partition(inp, &mut ev.concat(), &mut cv.concat(), &mut rows, &mut acc);
                 (rows, acc)
             },
         )
@@ -106,16 +90,7 @@ where
         .unwrap_or_else(|| (Vec::new(), Acc::new(inp.ncamp, inp.ndays)))
 }
 
-fn partition<'a, C>(
-    inp: &Input,
-    click_id: &C,
-    ev: &mut [(i64, i64)],
-    cv: &mut [(i64, u32, u32)],
-    rows: &mut Vec<UserDay>,
-    acc: &mut Acc,
-) where
-    C: Fn(u32) -> &'a [u8],
-{
+fn partition(inp: &Input, ev: &mut [SessEvent], cv: &mut [SessClick], rows: &mut Vec<UserDay>, acc: &mut Acc) {
     if ev.is_empty() {
         return;
     }
@@ -209,7 +184,7 @@ fn partition<'a, C>(
                     if cts(x) != tb {
                         break;
                     }
-                    if click_id(cv[x].2) < click_id(cv[b].2) {
+                    if bytes(cv[x].3, cv[x].2) < bytes(cv[b].3, cv[b].2) {
                         b = x;
                     }
                 }
