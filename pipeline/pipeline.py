@@ -7,7 +7,7 @@ Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parque
 Temp   $SCRATCH_DIR (default /scratch)
 
 Stages, each a DuckDB table:
-  parse    Polars splits every CSV line into fields (our own dialect check)
+  parse    fastparse.py (compiled with Numba) turns every CSV line into typed columns
   links -> idmap         union-find over linked IDs: user_id -> person
   events -> ev -> sess   dedup, validate, sessionize
   clicks -> clk          dedup, validate
@@ -15,11 +15,10 @@ Stages, each a DuckDB table:
 """
 import glob
 import json
-import mmap
 import os
+import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -27,16 +26,28 @@ SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
 NCPU = int(os.environ.get("NCPU", os.cpu_count() or 1))
 MEM_GB = int(os.environ.get("MEM_GB", "8"))
 
-# Polars sizes its pool from the host's CPU count, which in a container can be
-# far more than the 8 we get. It reads this variable once, at import.
-os.environ["POLARS_MAX_THREADS"] = str(NCPU)
+# Numba reads these once, at import. Its thread pool would otherwise size
+# itself from the host's CPU count. Its compiled-code cache must be writable
+# or it is ignored, and /app is read-only at run time, so the cache the image
+# build made (see Dockerfile) is copied to scratch. "generic" matches how that
+# cache was compiled, whatever CPU the image was built on.
+NUMBA_BUILD_CACHE = "/app/numba_cache"
+os.environ["NUMBA_NUM_THREADS"] = str(NCPU)
+os.environ["NUMBA_CPU_NAME"] = "generic"
+os.environ["NUMBA_CACHE_DIR"] = os.path.join(SCRATCH, "numba_cache")
+try:
+    if os.path.isdir(NUMBA_BUILD_CACHE):
+        shutil.copytree(NUMBA_BUILD_CACHE, os.environ["NUMBA_CACHE_DIR"], dirs_exist_ok=True)
+except OSError:
+    pass  # local runs without /scratch: Numba falls back to compiling
 
 import duckdb  # noqa: E402
 import numpy as np  # noqa: E402
-import polars as pl  # noqa: E402
 import pyarrow as pa  # noqa: E402
 from scipy.sparse import coo_matrix  # noqa: E402
 from scipy.sparse.csgraph import connected_components  # noqa: E402
+
+import fastparse  # noqa: E402
 
 DAY = 86_400_000
 GAP = 1_800_000
@@ -54,7 +65,7 @@ except OSError:
     pass  # local runs without /scratch; DuckDB only needs it when it spills
 con = duckdb.connect()
 con.execute(f"SET threads = {NCPU}")
-# The parsed Polars frames live outside DuckDB's budget, so leave room for them.
+# The parsed Arrow tables live outside DuckDB's budget, so leave room for them.
 con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.6))}GB'")
 con.execute(f"SET temp_directory = '{os.path.join(SCRATCH, 'duckdb_tmp')}'")
 con.execute("SET preserve_insertion_order = false")
@@ -84,75 +95,10 @@ log(f"window {manifest['window_start']} .. {manifest['window_end']}")
 
 sql("CREATE MACRO ms_to_day(ms) AS (DATE '1970-01-01' + (ms // 86400000)::INTEGER)")
 
-# --- Timestamps -----------------------------------------------------------
-# A Polars expression: BIGINT epoch ms, or null when bad. [0-9] (never \d)
-# keeps digits ASCII, and the date parse rejects impossible days like Feb 30.
-# Polars evaluates every when/then branch on every row, so all casts are
-# non-strict. F3 values over 18 significant digits can't fit in an i64, and
-# are far outside any window anyway.
-
-ISO = (r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
-       r"(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$")
 
 
-def ts_expr(col):
-    s = pl.col(col)
-
-    def num(start, length):
-        return s.str.slice(start, length).cast(pl.Int64, strict=False)
-
-    days = s.str.slice(0, 10).str.to_date("%Y-%m-%d", strict=False).cast(pl.Int64)
-    local = days * DAY + num(11, 2) * 3_600_000 + num(14, 2) * 60_000 + num(17, 2) * 1000
-    offset = (pl.when(s.str.len_bytes() == 20).then(0)
-              .otherwise(pl.when(s.str.slice(19, 1) == "+").then(1).otherwise(-1)
-                         * (num(20, 2) * 3_600_000 + num(23, 2) * 60_000)))
-    epoch = s.str.contains(r"^[0-9]+$") & (s.str.strip_chars_start("0").str.len_bytes() <= 18)
-    return pl.when(s.str.contains(ISO)).then(local - offset).when(epoch).then(s.cast(pl.Int64, strict=False))
-
-# --- Parsing --------------------------------------------------------------
-# Polars reads each file as whole lines (a separator and no quote char that
-# never occur), and its Rust string kernels validate and split them about
-# twice as fast as DuckDB's. It keeps a \r inside a line but strips one at the
-# end, so files containing any \r (never the generator's) are split on \n by
-# hand instead. A threaded mmap search finds them without copying the files.
-
-FIELD = r'(?:"[^",]*"|[^",]*)'
-
-
-def has_cr(path):
-    if os.path.getsize(path) == 0:
-        return False
-    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        return m.find(b"\r") != -1
-
-
-def parse_fields(kind, n):
-    """Well-formed lines of `kind` as a lazy Polars frame of n string columns f1..fn, quotes stripped.
-
-    A line is well-formed when it has exactly n fields and every quote wraps a
-    whole field; one regex checks both. Empty fields stay '', never null.
-    """
-    names = [f"f{i}" for i in range(1, n + 1)]
-    files = sorted(glob.glob(os.path.join(DATA, kind, "*.csv")))
-    with ThreadPoolExecutor(NCPU) as ex:
-        cr = list(ex.map(has_cr, files))
-    frames = []
-    fast = [p for p, c in zip(files, cr) if not c]
-    if fast:
-        frames.append(pl.scan_csv(fast, separator="\x01", quote_char=None, has_header=True, new_columns=["line"],
-                                  schema={"line": pl.String}, infer_schema=False))
-    for p, c in zip(files, cr):
-        if c:
-            with open(p, encoding="utf-8", newline="") as f:
-                frames.append(pl.LazyFrame({"line": f.read().split("\n")[1:]}, schema={"line": pl.String}))
-    if not frames:
-        return pl.LazyFrame(schema={c: pl.String for c in names})
-    pattern = "^" + FIELD + ("," + FIELD) * (n - 1) + "$"
-    return (pl.concat(frames)
-            .filter(pl.col("line").str.contains(pattern))
-            .select(pl.col("line").str.replace_all('"', "", literal=True)
-                    .str.split_exact(",", n - 1).struct.rename_fields(names).alias("s"))
-            .unnest("s"))
+def csv_files(kind):
+    return sorted(glob.glob(os.path.join(DATA, kind, "*.csv")))
 
 
 # --- Small dimension tables -----------------------------------------------
@@ -164,13 +110,9 @@ sql(f"""CREATE TABLE campaigns AS SELECT * FROM read_csv('{os.path.join(DATA, "c
 
 # --- Links: who is one person ---------------------------------------------
 
-con.register("links_f", parse_fields("links", 2).collect())
-sql(f"""
-CREATE TABLE links AS
-SELECT f1 AS a, f2 AS b FROM links_f
-WHERE f1 <> '' AND f2 <> ''
-""", "links parsed")
-con.unregister("links_f")
+links_f = fastparse.read_links(csv_files("links"))
+sql("CREATE TABLE links AS SELECT a, b FROM links_f", "links parsed")
+del links_f
 sql("""
 CREATE TABLE link_ids AS
 SELECT id, (row_number() OVER () - 1)::INTEGER AS k
@@ -195,22 +137,12 @@ SELECT c.id, n.person FROM c JOIN (SELECT comp, min(id) AS person FROM c GROUP B
 con.unregister("comp_arrow")
 
 # --- Events ---------------------------------------------------------------
-# Polars turns each copy into typed values plus an `ok` flag for the field
+# fastparse turns each copy into typed values plus an `ok` flag for the field
 # rules; DuckDB then keeps the copy with the smallest ingest_ts per event_id.
 # Judging every copy before dedup is the same as judging only the kept copy,
 # because the flag travels with the copy it belongs to.
 
-col = pl.col
-events_f = (parse_fields("events", 7)
-            .filter(col("f1") != "")
-            .select(event_id=col("f1"), user_id=col("f2"), product_id=col("f6"),
-                    ts=ts_expr("f3"), ingest_ms=ts_expr("f4"),
-                    is_purchase=col("f5") == "purchase",
-                    price=pl.when((col("f5") == "purchase") & col("f7").str.contains(r"^[0-9]+$")
-                                  & (col("f7").str.strip_chars_start("0").str.len_bytes() <= 8))
-                          .then(col("f7").cast(pl.Int32, strict=False)),
-                    ok=col("f5").is_in(["view", "cart", "purchase"]) & (col("f2") != "") & (col("f6") != ""))
-            .collect())
+events_f = fastparse.read_events(csv_files("events"))
 con.register("events_f", events_f)
 log("events parsed")
 sql(f"""
@@ -256,10 +188,7 @@ FROM ev_s GROUP BY person, start
 
 # --- Clicks ---------------------------------------------------------------
 
-con.register("clicks_f", parse_fields("clicks", 4)
-             .filter((col("f1") != "") & (col("f2") != ""))
-             .select(click_id=col("f1"), user_id=col("f2"), campaign_id=col("f3"), ts=ts_expr("f4"))
-             .collect())
+con.register("clicks_f", fastparse.read_clicks(csv_files("clicks")))
 sql(f"""
 CREATE TABLE clk AS
 SELECT DISTINCT coalesce(m.person, c.user_id) AS person, c.click_id, c.campaign_id, c.ts
@@ -287,10 +216,10 @@ FROM sess s ASOF LEFT JOIN latest l ON s.person = l.person AND l.ts <= s.start
 # A click at t assists every session of its person starting in [t, t + 7d].
 # Per (person, campaign), merge overlapping intervals so none overlap; then a
 # session is assisted by that campaign iff it falls in exactly one interval,
-# and counting sessions per interval counts each (session, campaign) once.
-# Counting without materializing session x campaign pairs: cut each interval
-# into one piece per UTC day, number each person's sessions by start, and
-# take (sessions starting <= hi) - (sessions starting < lo) with two ASOF joins.
+# and joining sessions to intervals counts each (session, campaign) once.
+# The join pairs every session with every interval of its person, but merged
+# intervals per person are bounded by the number of campaigns, so even the
+# biggest people stay small (about 600k pairs at 20M events, 81M in all).
 
 sql(f"""
 CREATE TABLE runs AS
@@ -307,31 +236,11 @@ FROM (
 GROUP BY person, campaign_id, run
 """, "click runs merged")
 
-sql(f"""
-CREATE TABLE sess_idx AS
-SELECT person, start, row_number() OVER (PARTITION BY person ORDER BY start) AS idx FROM sess
-""")
-sql(f"""
-CREATE TABLE pieces AS
-WITH days AS (SELECT DISTINCT person, start // {DAY} AS d FROM sess),
-cut AS (
-    SELECT person, campaign_id, d, greatest(lo, d * {DAY}) AS lo, least(hi, (d + 1) * {DAY} - 1) AS hi
-    FROM (SELECT *, unnest(range(greatest(lo, {WS}) // {DAY}, least(hi, {WE} - 1) // {DAY} + 1)) AS d FROM runs)
-)
-SELECT cut.* FROM cut SEMI JOIN days ON cut.person = days.person AND cut.d = days.d
-""", "interval pieces")
 sql("""
 CREATE TABLE assists AS
-WITH a AS (
-    SELECT p.*, s.idx AS idx_hi FROM pieces p
-    ASOF LEFT JOIN sess_idx s ON p.person = s.person AND s.start <= p.hi
-), b AS (
-    SELECT a.*, s.idx AS idx_lo FROM a
-    ASOF LEFT JOIN sess_idx s ON a.person = s.person AND s.start < a.lo
-)
-SELECT campaign_id, ms_to_day(d * 86400000) AS day,
-       sum(coalesce(idx_hi, 0) - coalesce(idx_lo, 0)) AS assisted_sessions
-FROM b GROUP BY ALL HAVING sum(coalesce(idx_hi, 0) - coalesce(idx_lo, 0)) > 0
+SELECT r.campaign_id, s.day, count(*) AS assisted_sessions
+FROM sess s JOIN runs r ON s.person = r.person AND s.start BETWEEN r.lo AND r.hi
+GROUP BY ALL
 """, "assists counted")
 
 # --- Outputs --------------------------------------------------------------
