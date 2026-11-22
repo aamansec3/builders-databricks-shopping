@@ -3,4 +3,6 @@
 !requirements.txt
 !run.sh
 !pipeline/
+!engine/
+engine/target/
 **/__pycache__

@@ -1,6 +1,16 @@
 # Shopping Sessions starter: DuckDB skeleton.
 # The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+# Stage 1: compile the Rust engine (engine/). Same Debian release as the final
+# image, so the binary links against the same glibc.
+FROM rust:1.100-slim-bookworm AS engine
+WORKDIR /src
+COPY engine/Cargo.toml engine/Cargo.lock ./
+COPY engine/src ./src
+RUN cargo build --release --locked
+
+# Stage 2: the image the scorer runs. It still holds the Python/Numba
+# pipeline as a fallback: run.sh picks which one runs.
 FROM python:3.12-slim-bookworm
 
 # The scorer runs the container as uid 1000; give that uid a name and a home.
@@ -10,6 +20,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
+COPY --from=engine /src/target/release/engine /app/engine
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 
