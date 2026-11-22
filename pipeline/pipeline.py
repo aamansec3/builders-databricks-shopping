@@ -7,8 +7,8 @@ Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parque
 Temp   $SCRATCH_DIR (default /scratch)
 
 Python only moves arrays between compiled Numba kernels (kernels.py):
-  load      every CSV file into one byte buffer, read in parallel
-  parse     each line into typed values and (start, length) pairs into the buffer
+  parse     one file at a time (the next one is read meanwhile): each line into
+            typed values, and the IDs still needed later into a compact heap
   events    dedup on event_id (earliest ingest_ts), then validate the kept copy
   people    number every user ID, union-find over the links
   sessions  per person: sessions, user_daily rows, click credit and assists
@@ -57,7 +57,6 @@ import pyarrow.parquet as pq  # noqa: E402
 import kernels as K  # noqa: E402
 
 PERSON_PARTS = 128  # partitions of people for the sessions kernel
-READ_CHUNK = 64 << 20
 T0 = time.time()
 
 
@@ -69,58 +68,72 @@ def parse_f1(s):
     return int(datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
-# --- Loading ----------------------------------------------------------------
+# --- Reading -----------------------------------------------------------------
 
-def load(data):
-    """Every links, events and clicks file in one uint8 buffer, each followed by
-    a \\n so no line runs into the next file (when a file already ends with \\n
-    that adds an empty line, which is malformed and dropped anyway).
+def csv_files(data, kind):
+    """(kind, path, size) of each non-empty *.csv file of a kind."""
+    paths = sorted(glob.glob(os.path.join(data, kind, "*.csv")))
+    return [(kind, p, os.path.getsize(p)) for p in paths if os.path.getsize(p) > 0]
 
-    Returns the buffer, the newline positions, which lines are headers, and the
-    line range [lo, hi) of each kind.
-    """
-    kinds = ["links", "events", "clicks"]
-    reads, starts, ends = [], [], {}
-    off = 0
-    for k in kinds:
-        for path in sorted(glob.glob(os.path.join(data, k, "*.csv"))):
-            size = os.path.getsize(path)
-            if size == 0:
-                continue
-            starts.append(off)
-            for at in range(0, size, READ_CHUNK):
-                reads.append((path, at, off + at, min(READ_CHUNK, size - at)))
-            off += size + 1
-        ends[k] = off
-    buf = np.empty(-(-off // 8) * 8, dtype=np.uint8)  # whole 8-byte words for K.newlines
-    buf[off:] = 0
+
+def read_file(path, size):
+    """A file's bytes followed by a \\n, so its last line always ends (when the
+    file already ends with \\n that adds an empty line, which is malformed and
+    dropped anyway), padded with zeros to whole 8-byte words for K.newlines."""
+    buf = np.empty(-(-(size + 1) // 8) * 8, dtype=np.uint8)
+    buf[size] = K.NEWLINE
+    buf[size + 1:] = 0
     view = memoryview(buf)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        at = 0
+        while at < size:
+            got = os.preadv(fd, [view[at:size]], at)
+            if got <= 0:
+                raise IOError(f"short read on {path}")
+            at += got
+    finally:
+        os.close(fd)
+    return buf
 
-    def read(job):
-        path, at, dst, n = job
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            while n > 0:
-                got = os.preadv(fd, [view[dst:dst + n]], at)
-                if got <= 0:
-                    raise IOError(f"short read on {path}")
-                at, dst, n = at + got, dst + got, n - got
-        finally:
-            os.close(fd)
 
-    with ThreadPoolExecutor(NCPU) as pool:
-        list(pool.map(read, reads))
-    for nxt in starts[1:] + [off]:
-        buf[nxt - 1] = K.NEWLINE
-    nl = K.newlines(buf)
-    header = np.zeros(len(nl), dtype=np.bool_)
-    header[np.searchsorted(nl, np.asarray(starts, dtype=np.int64))] = True
-    lines, lo = {}, 0
-    for k in kinds:
-        hi = int(np.searchsorted(nl, ends[k]))
-        lines[k] = (lo, hi)
-        lo = hi
-    return buf, nl, header, lines
+def stream(files):
+    """Yield (kind, bytes) of each file in turn, reading the next file on a
+    background thread while the caller parses this one. (The parse kernels
+    release the GIL, so the two really run at the same time.)"""
+    with ThreadPoolExecutor(1) as pool:
+        ahead = pool.submit(read_file, files[0][1], files[0][2]) if files else None
+        for i, (kind, _, _) in enumerate(files):
+            buf = ahead.result()
+            if i + 1 < len(files):
+                ahead = pool.submit(read_file, files[i + 1][1], files[i + 1][2])
+            yield kind, buf
+
+
+class Columns:
+    """Named arrays that each file appends its rows to. They start sized for a
+    generous estimate of the row count: space no row reaches costs address
+    space only, not memory. A file that brings more rows makes them grow."""
+
+    def __init__(self, rows, **dtypes):
+        self.used = 0
+        self.arrays = {name: np.empty(rows, dtype) for name, dtype in dtypes.items()}
+
+    def append(self, rows):
+        """Make room for rows more; returns the first new row."""
+        cap = len(next(iter(self.arrays.values())))
+        if self.used + rows > cap:
+            grown = max(2 * cap, self.used + rows)
+            for name, a in self.arrays.items():
+                b = np.empty(grown, a.dtype)
+                b[:self.used] = a[:self.used]
+                self.arrays[name] = b
+        base = self.used
+        self.used += rows
+        return base
+
+    def done(self):
+        return {name: a[:self.used] for name, a in self.arrays.items()}
 
 
 def dimension(path):
@@ -158,53 +171,62 @@ def run(data, out):
     ctab = K.table(cbuf, cs, cn)
     ncamp = len(campaign_ids)
 
-    buf, nl, header, lines = load(data)
-    log(f"loaded {len(buf) >> 20} MB, {len(nl)} lines")
-
-    # --- Parse
-    lo, hi = lines["links"]
-    a_s, b_s = np.empty(hi - lo, np.int64), np.empty(hi - lo, np.int64)
-    a_n, b_n = np.empty(hi - lo, np.int32), np.empty(hi - lo, np.int32)
-    lok = np.empty(hi - lo, np.bool_)
-    K.parse_links(buf, nl, header, lo, hi, a_s, a_n, b_s, b_n, lok)
-
-    lo, hi = lines["events"]
-    # Positions into buf and timestamps need 64 bits; lengths and prices fit in 32.
-    eid_s, uid_s, ts, ingest = (np.empty(hi - lo, np.int64) for _ in range(4))
-    eid_n, uid_n, price = (np.empty(hi - lo, np.int32) for _ in range(3))
-    eid_h = np.empty(hi - lo, np.uint64)
-    typ = np.empty(hi - lo, np.int8)
-    cat = np.empty(hi - lo, np.int16)
-    eok = np.empty(hi - lo, np.bool_)
-    K.parse_events(buf, nl, header, lo, hi, ptab, pbuf, ps, pn, pcat, cat_index["unknown"],
-                   eid_s, eid_n, eid_h, uid_s, uid_n, ts, ingest, typ, price, cat, eok)
-
-    lo, hi = lines["clicks"]
-    cid_s, cu_s, cts = (np.empty(hi - lo, np.int64) for _ in range(3))
-    cid_n, cu_n = np.empty(hi - lo, np.int32), np.empty(hi - lo, np.int32)
-    camp = np.empty(hi - lo, np.int32)
-    cok = np.empty(hi - lo, np.bool_)
-    K.parse_clicks(buf, nl, header, lo, hi, ws - K.WEEK, we, ctab, cbuf, cs, cn,
-                   cid_s, cid_n, cu_s, cu_n, cts, camp, cok)
-    del nl, header
-    log("parsed")
+    # --- Read and parse, one file at a time. Only the strings still needed
+    # later are kept, copied into heap; each file's bytes are dropped once parsed.
+    files = csv_files(data, "links") + csv_files(data, "events") + csv_files(data, "clicks")
+    size = {k: sum(f[2] for f in files if f[0] == k) for k in ("links", "events", "clicks")}
+    heap = np.empty(sum(size.values()) + 8, np.uint8)  # strings never outgrow the input
+    hpos = 0
+    # Row estimates: an events line is ~95 bytes, a clicks line ~50, a links line ~25.
+    links = Columns(size["links"] // 4 + len(files), hs=np.int64, a_n=np.int32, b_n=np.int32, ok=np.bool_)
+    events = Columns(size["events"] // 32 + len(files), hs=np.int64, eid_n=np.int32, eid_h=np.uint64,
+                     uid_n=np.int32, ts=np.int64, ingest=np.int64, typ=np.int8, price=np.int32,
+                     cat=np.int16, ok=np.bool_)
+    clicks = Columns(size["clicks"] // 16 + len(files), hs=np.int64, cid_n=np.int32, uid_n=np.int32,
+                     ts=np.int64, camp=np.int32, ok=np.bool_)
+    for kind, buf in stream(files):
+        nl = K.newlines(buf)
+        if kind == "links":
+            base = links.append(len(nl))
+            c = links.arrays
+            hpos = K.parse_links(buf, nl, base, heap, hpos, c["hs"], c["a_n"], c["b_n"], c["ok"])
+        elif kind == "events":
+            base = events.append(len(nl))
+            c = events.arrays
+            hpos = K.parse_events(buf, nl, ptab, pbuf, ps, pn, pcat, cat_index["unknown"], base, heap, hpos,
+                                  c["hs"], c["eid_n"], c["eid_h"], c["uid_n"], c["ts"], c["ingest"],
+                                  c["typ"], c["price"], c["cat"], c["ok"])
+        else:
+            base = clicks.append(len(nl))
+            c = clicks.arrays
+            hpos = K.parse_clicks(buf, nl, ws - K.WEEK, we, ctab, cbuf, cs, cn, base, heap, hpos,
+                                  c["hs"], c["cid_n"], c["uid_n"], c["ts"], c["camp"], c["ok"])
+    del buf, nl, c
+    L, E, C = links.done(), events.done(), clicks.done()
+    del links, events, clicks
+    lhs, a_n, b_n, lok = L["hs"], L["a_n"], L["b_n"], L["ok"]
+    ehs, eid_n, eid_h, uid_n, eok = E["hs"], E["eid_n"], E["eid_h"], E["uid_n"], E["ok"]
+    ts, ingest, typ, price, cat = E["ts"], E["ingest"], E["typ"], E["price"], E["cat"]
+    chs, cid_n, cu_n, cts, camp, cok = C["hs"], C["cid_n"], C["uid_n"], C["ts"], C["camp"], C["ok"]
+    del L, E, C
+    log(f"read and parsed {sum(size.values()) >> 20} MB in {len(files)} files: {hpos >> 20} MB of IDs kept")
 
     # --- Events: keep the earliest copy of each event_id, then validate it
     order, off = K.partition(K.hash_parts(eid_h, eok), K.GROUP_PARTS)
-    gidp, _, goff = K.group(buf, eid_s, eid_n, eid_h, order, off)
+    gidp, _, goff = K.group(heap, ehs, eid_n, eid_h, order, off)
     chosen = np.zeros(len(ts), np.bool_)
     K.earliest(gidp, order, off, goff, ingest, chosen)
-    del order, off, gidp, goff, eid_s, eid_n, eid_h, eok
+    del order, off, gidp, goff, eid_h, eok
     keep = np.zeros(len(ts), np.bool_)
     K.validate(chosen, uid_n, ts, ingest, typ, price, cat, ws, we, keep)
     del chosen, ingest
     log("events deduped, validated")
 
-    # From here on, only user IDs and click IDs are read from the input bytes:
-    # copy those into small buffers and free the big one (~1/3 of peak memory).
-    cid_buf, cid_s = K.compact(buf, cid_s, cid_n, cok)
-    ubuf, s, n, h, part = K.user_items(buf, a_s, a_n, b_s, b_n, lok, uid_s, uid_n, keep, cu_s, cu_n, cok)
-    del buf, a_s, a_n, b_s, b_n, uid_s, uid_n, cu_s, cu_n
+    # From here on, only user IDs and click IDs are needed: copy those into
+    # small buffers of their own and free the heap.
+    cid_buf, cid_s = K.compact(heap, chs, cid_n, cok)
+    ubuf, s, n, h, part = K.user_items(heap, lhs, a_n, b_n, lok, ehs, eid_n, uid_n, keep, chs, cid_n, cu_n, cok)
+    del heap, lhs, a_n, b_n, ehs, eid_n, uid_n, chs, cu_n
 
     # --- People: number every user ID, then join linked ones
     order, off = K.partition(part, K.GROUP_PARTS)

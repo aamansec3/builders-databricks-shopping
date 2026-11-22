@@ -266,7 +266,7 @@ def _newline_count(bits):
     return ((bits >> np.uint64(7)) * ONES) >> np.uint64(56)
 
 
-@nb.njit(cache=True, parallel=True)
+@nb.njit(cache=True, parallel=True, nogil=True)
 def newlines(buf):
     """Positions of every \\n. Two parallel passes over chunks: count, then write at
     each chunk's offset. Both look at 8 bytes at a time; a line is ~70 bytes, so
@@ -294,27 +294,50 @@ def newlines(buf):
     return nl
 
 
-@nb.njit(cache=True, parallel=True)
-def parse_links(buf, nl, header, lo, hi, a_s, a_n, b_s, b_n, ok):
-    """Lines lo..hi of links: ok when well-formed with both IDs non-empty."""
-    n = hi - lo
+@nb.njit(cache=True, inline="always")
+def _place(hs, n1, n2, lo, hi, hpos):
+    """Heap start of rows lo..hi, whose two strings take n1 + n2 bytes each, from hpos on.
+    Returns the new heap fill. (Rows that aren't ok have both lengths 0.)"""
+    for r in range(lo, hi):
+        hs[r] = hpos
+        hpos += n1[r] + n2[r]
+    return hpos
+
+
+# Each parse kernel takes one file's bytes and its newline positions (line 0
+# is the header) and fills rows base.. of its columns, one row per line. The
+# two string fields that are still needed after parsing are copied into heap,
+# side by side from hs[row]: the first field, then the second right after it.
+
+@nb.njit(cache=True, parallel=True, nogil=True)
+def parse_links(buf, nl, base, heap, hpos, hs, a_n, b_n, ok):
+    """ok when well-formed with both IDs non-empty. Strings: a, then b."""
+    n = len(nl)
+    src = np.empty(2 * n, np.int64)
     nch, size = _chunks(n)
     for c in nb.prange(nch):
         fb = np.empty(4, np.int64)
         for j in range(c * size, min(n, (c + 1) * size)):
-            i = lo + j
-            s = nl[i - 1] + 1 if i > 0 else 0
-            good = not header[i] and _fields(buf, s, nl[i], fb, 2) and fb[1] > fb[0] and fb[3] > fb[2]
-            ok[j] = good
-            a_s[j], a_n[j] = fb[0], fb[1] - fb[0]
-            b_s[j], b_n[j] = fb[2], fb[3] - fb[2]
+            r = base + j
+            s = nl[j - 1] + 1 if j > 0 else 0
+            good = j > 0 and _fields(buf, s, nl[j], fb, 2) and fb[1] > fb[0] and fb[3] > fb[2]
+            ok[r] = good
+            a_n[r], b_n[r] = (fb[1] - fb[0], fb[3] - fb[2]) if good else (0, 0)
+            src[2 * j], src[2 * j + 1] = fb[0], fb[2]
+    hpos = _place(hs, a_n, b_n, base, base + n, hpos)
+    for c in nb.prange(nch):
+        for j in range(c * size, min(n, (c + 1) * size)):
+            r = base + j
+            _copy(buf, src[2 * j], heap, hs[r], a_n[r])
+            _copy(buf, src[2 * j + 1], heap, hs[r] + a_n[r], b_n[r])
+    return hpos
 
 
-@nb.njit(cache=True, parallel=True)
-def parse_events(buf, nl, header, lo, hi, ptab, pbuf, ps, pn, pcat, unknown,
-                 eid_s, eid_n, eid_h, uid_s, uid_n, ts, ingest, typ, price, cat, ok):
-    """Lines lo..hi of events. ok when well-formed with a non-empty event_id;
-    the other field rules are checked on the kept copy, after dedup.
+@nb.njit(cache=True, parallel=True, nogil=True)
+def parse_events(buf, nl, ptab, pbuf, ps, pn, pcat, unknown, base, heap, hpos, hs,
+                 eid_n, eid_h, uid_n, ts, ingest, typ, price, cat, ok):
+    """ok when well-formed with a non-empty event_id; the other field rules
+    are checked on the kept copy, after dedup. Strings: event_id, then user_id.
 
     Fields: 0 event_id, 1 user_id, 2 ts, 3 ingest_ts, 4 event_type, 5 product_id,
     6 price_cents. price is -1 unless the event is a purchase whose price is
@@ -322,22 +345,24 @@ def parse_events(buf, nl, header, lo, hi, ptab, pbuf, ps, pn, pcat, unknown,
     the product's category index (unknown when it isn't in products.csv), or -1
     when product_id is empty; only the category is ever needed, not the ID.
     """
-    n = hi - lo
+    n = len(nl)
+    src = np.empty(2 * n, np.int64)
     nch, size = _chunks(n)
     for c in nb.prange(nch):
         fb = np.empty(14, np.int64)
         for j in range(c * size, min(n, (c + 1) * size)):
-            i = lo + j
-            s = nl[i - 1] + 1 if i > 0 else 0
-            good = not header[i] and _fields(buf, s, nl[i], fb, 7) and fb[1] > fb[0]
-            ok[j] = good
+            r = base + j
+            s = nl[j - 1] + 1 if j > 0 else 0
+            good = j > 0 and _fields(buf, s, nl[j], fb, 7) and fb[1] > fb[0]
+            ok[r] = good
             if not good:
+                eid_n[r], uid_n[r] = 0, 0
                 continue
-            eid_s[j], eid_n[j] = fb[0], fb[1] - fb[0]
-            eid_h[j] = _hash(buf, fb[0], fb[1] - fb[0])
-            uid_s[j], uid_n[j] = fb[2], fb[3] - fb[2]
-            ts[j] = _ts(buf, fb[4], fb[5])
-            ingest[j] = _ts(buf, fb[6], fb[7])
+            src[2 * j], src[2 * j + 1] = fb[0], fb[2]
+            eid_n[r], uid_n[r] = fb[1] - fb[0], fb[3] - fb[2]
+            eid_h[r] = _hash(buf, fb[0], fb[1] - fb[0])
+            ts[r] = _ts(buf, fb[4], fb[5])
+            ingest[r] = _ts(buf, fb[6], fb[7])
             t = 0
             if _is(buf, fb[8], fb[9], VIEW_W):
                 t = VIEW
@@ -345,43 +370,58 @@ def parse_events(buf, nl, header, lo, hi, ptab, pbuf, ps, pn, pcat, unknown,
                 t = CART
             elif _is(buf, fb[8], fb[9], PURCHASE_W):
                 t = PURCHASE
-            typ[j] = t
-            price[j] = _digits(buf, fb[12], fb[13], 8) if t == PURCHASE else -1
+            typ[r] = t
+            price[r] = _digits(buf, fb[12], fb[13], 8) if t == PURCHASE else -1
             if fb[11] == fb[10]:
-                cat[j] = -1
+                cat[r] = -1
             else:
                 k = _find(ptab, pbuf, ps, pn, buf, fb[10], fb[11] - fb[10])
-                cat[j] = pcat[k] if k >= 0 else unknown
+                cat[r] = pcat[k] if k >= 0 else unknown
+    hpos = _place(hs, eid_n, uid_n, base, base + n, hpos)
+    for c in nb.prange(nch):
+        for j in range(c * size, min(n, (c + 1) * size)):
+            r = base + j
+            _copy(buf, src[2 * j], heap, hs[r], eid_n[r])
+            _copy(buf, src[2 * j + 1], heap, hs[r] + eid_n[r], uid_n[r])
+    return hpos
 
 
-@nb.njit(cache=True, parallel=True)
-def parse_clicks(buf, nl, header, lo, hi, ts_lo, ts_hi, ctab, cbuf, cs, cn,
-                 cid_s, cid_n, uid_s, uid_n, ts, camp, ok):
-    """Lines lo..hi of clicks. ok when the click is valid: well-formed, non-empty
-    click_id and user_id, ts in [ts_lo, ts_hi), campaign in campaigns.csv.
+@nb.njit(cache=True, parallel=True, nogil=True)
+def parse_clicks(buf, nl, ts_lo, ts_hi, ctab, cbuf, cs, cn, base, heap, hpos, hs,
+                 cid_n, uid_n, ts, camp, ok):
+    """ok when the click is valid: well-formed, non-empty click_id and user_id,
+    ts in [ts_lo, ts_hi), campaign in campaigns.csv. Strings: click_id, then user_id.
 
     Copies of a click are identical, so they are not deduped: a copy can't change
     which campaign a session credits, or the set of campaigns that assist it.
     """
-    n = hi - lo
+    n = len(nl)
+    src = np.empty(2 * n, np.int64)
     nch, size = _chunks(n)
     for c in nb.prange(nch):
         fb = np.empty(8, np.int64)
         for j in range(c * size, min(n, (c + 1) * size)):
-            i = lo + j
-            s = nl[i - 1] + 1 if i > 0 else 0
-            good = not header[i] and _fields(buf, s, nl[i], fb, 4) and fb[1] > fb[0] and fb[3] > fb[2]
+            r = base + j
+            s = nl[j - 1] + 1 if j > 0 else 0
+            good = j > 0 and _fields(buf, s, nl[j], fb, 4) and fb[1] > fb[0] and fb[3] > fb[2]
             if good:
                 t = _ts(buf, fb[6], fb[7])
                 good = ts_lo <= t < ts_hi
-                ts[j] = t
+                ts[r] = t
             if good:
                 k = _find(ctab, cbuf, cs, cn, buf, fb[4], fb[5] - fb[4])
                 good = k >= 0
-                camp[j] = k
-            ok[j] = good
-            cid_s[j], cid_n[j] = fb[0], fb[1] - fb[0]
-            uid_s[j], uid_n[j] = fb[2], fb[3] - fb[2]
+                camp[r] = k
+            ok[r] = good
+            cid_n[r], uid_n[r] = (fb[1] - fb[0], fb[3] - fb[2]) if good else (0, 0)
+            src[2 * j], src[2 * j + 1] = fb[0], fb[2]
+    hpos = _place(hs, cid_n, uid_n, base, base + n, hpos)
+    for c in nb.prange(nch):
+        for j in range(c * size, min(n, (c + 1) * size)):
+            r = base + j
+            _copy(buf, src[2 * j], heap, hs[r], cid_n[r])
+            _copy(buf, src[2 * j + 1], heap, hs[r] + cid_n[r], uid_n[r])
+    return hpos
 
 
 # --- Grouping equal strings --------------------------------------------------
@@ -552,12 +592,12 @@ def _copy(buf, s0, out, o, n0):
 
 
 @nb.njit(cache=True, parallel=True)
-def user_items(buf, a_s, a_n, b_s, b_n, lok, eu_s, eu_n, keep, cu_s, cu_n, cok):
+def user_items(heap, lhs, a_n, b_n, lok, ehs, eid_n, uid_n, keep, chs, cid_n, cu_n, cok):
     """Every user ID to number, as rows: both sides of each link (rows 2j, 2j+1),
     then each kept event, then each valid click; unused rows are dropped.
 
-    The IDs are copied into a new, dense buffer, so the big input buffer can be
-    freed. Returns it, and each row's start in it, length, hash and partition.
+    The IDs are copied into a new, dense buffer, so the heap can be freed.
+    Returns it, and each row's start in it, length, hash and partition.
     """
     nl_, ne, nc = len(lok), len(keep), len(cok)
     m = 2 * nl_ + ne + nc
@@ -565,12 +605,12 @@ def user_items(buf, a_s, a_n, b_s, b_n, lok, eu_s, eu_n, keep, cu_s, cu_n, cok):
     h = np.empty(m, np.uint64)
     part = np.empty(m, np.int16)
     for j in nb.prange(nl_):
-        _item(buf, a_s[j], a_n[j], lok[j], 2 * j, n, h, part)
-        _item(buf, b_s[j], b_n[j], lok[j], 2 * j + 1, n, h, part)
+        _item(heap, lhs[j], a_n[j], lok[j], 2 * j, n, h, part)
+        _item(heap, lhs[j] + a_n[j], b_n[j], lok[j], 2 * j + 1, n, h, part)
     for j in nb.prange(ne):
-        _item(buf, eu_s[j], eu_n[j], keep[j], 2 * nl_ + j, n, h, part)
+        _item(heap, ehs[j] + eid_n[j], uid_n[j], keep[j], 2 * nl_ + j, n, h, part)
     for j in nb.prange(nc):
-        _item(buf, cu_s[j], cu_n[j], cok[j], 2 * nl_ + ne + j, n, h, part)
+        _item(heap, chs[j] + cid_n[j], cu_n[j], cok[j], 2 * nl_ + ne + j, n, h, part)
     s = np.empty(m, np.int64)
     run = 0
     for i in range(m):
@@ -578,12 +618,12 @@ def user_items(buf, a_s, a_n, b_s, b_n, lok, eu_s, eu_n, keep, cu_s, cu_n, cok):
         run += n[i]
     out = np.empty(max(run, 1), np.uint8)
     for j in nb.prange(nl_):
-        _copy(buf, a_s[j], out, s[2 * j], n[2 * j])
-        _copy(buf, b_s[j], out, s[2 * j + 1], n[2 * j + 1])
+        _copy(heap, lhs[j], out, s[2 * j], n[2 * j])
+        _copy(heap, lhs[j] + a_n[j], out, s[2 * j + 1], n[2 * j + 1])
     for j in nb.prange(ne):
-        _copy(buf, eu_s[j], out, s[2 * nl_ + j], n[2 * nl_ + j])
+        _copy(heap, ehs[j] + eid_n[j], out, s[2 * nl_ + j], n[2 * nl_ + j])
     for j in nb.prange(nc):
-        _copy(buf, cu_s[j], out, s[2 * nl_ + ne + j], n[2 * nl_ + ne + j])
+        _copy(heap, chs[j] + cid_n[j], out, s[2 * nl_ + ne + j], n[2 * nl_ + ne + j])
     return out, s, n, h, part
 
 
