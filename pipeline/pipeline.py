@@ -163,20 +163,25 @@ def run(data, out):
 
     # --- Parse
     lo, hi = lines["links"]
-    a_s, a_n, b_s, b_n = (np.empty(hi - lo, np.int64) for _ in range(4))
+    a_s, b_s = np.empty(hi - lo, np.int64), np.empty(hi - lo, np.int64)
+    a_n, b_n = np.empty(hi - lo, np.int32), np.empty(hi - lo, np.int32)
     lok = np.empty(hi - lo, np.bool_)
     K.parse_links(buf, nl, header, lo, hi, a_s, a_n, b_s, b_n, lok)
 
     lo, hi = lines["events"]
-    eid_s, eid_n, uid_s, uid_n, pid_s, pid_n, ts, ingest, price = (np.empty(hi - lo, np.int64) for _ in range(9))
+    # Positions into buf and timestamps need 64 bits; lengths and prices fit in 32.
+    eid_s, uid_s, ts, ingest = (np.empty(hi - lo, np.int64) for _ in range(4))
+    eid_n, uid_n, price = (np.empty(hi - lo, np.int32) for _ in range(3))
     eid_h = np.empty(hi - lo, np.uint64)
     typ = np.empty(hi - lo, np.int8)
+    cat = np.empty(hi - lo, np.int16)
     eok = np.empty(hi - lo, np.bool_)
-    K.parse_events(buf, nl, header, lo, hi, eid_s, eid_n, eid_h, uid_s, uid_n, pid_s, pid_n,
-                   ts, ingest, typ, price, eok)
+    K.parse_events(buf, nl, header, lo, hi, ptab, pbuf, ps, pn, pcat, cat_index["unknown"],
+                   eid_s, eid_n, eid_h, uid_s, uid_n, ts, ingest, typ, price, cat, eok)
 
     lo, hi = lines["clicks"]
-    cid_s, cid_n, cu_s, cu_n, cts = (np.empty(hi - lo, np.int64) for _ in range(5))
+    cid_s, cu_s, cts = (np.empty(hi - lo, np.int64) for _ in range(3))
+    cid_n, cu_n = np.empty(hi - lo, np.int32), np.empty(hi - lo, np.int32)
     camp = np.empty(hi - lo, np.int32)
     cok = np.empty(hi - lo, np.bool_)
     K.parse_clicks(buf, nl, header, lo, hi, ws - K.WEEK, we, ctab, cbuf, cs, cn,
@@ -191,19 +196,22 @@ def run(data, out):
     K.earliest(gidp, order, off, goff, ingest, chosen)
     del order, off, gidp, goff, eid_s, eid_n, eid_h, eok
     keep = np.zeros(len(ts), np.bool_)
-    cat = np.empty(len(ts), np.int16)
-    K.validate(chosen, buf, uid_n, ts, ingest, typ, price, pid_s, pid_n, ws, we,
-               ptab, pbuf, ps, pn, pcat, cat_index["unknown"], keep, cat)
-    del chosen, ingest, pid_s, pid_n
+    K.validate(chosen, uid_n, ts, ingest, typ, price, cat, ws, we, keep)
+    del chosen, ingest
     log("events deduped, validated")
 
+    # From here on, only user IDs and click IDs are read from the input bytes:
+    # copy those into small buffers and free the big one (~1/3 of peak memory).
+    cid_buf, cid_s = K.compact(buf, cid_s, cid_n, cok)
+    ubuf, s, n, h, part = K.user_items(buf, a_s, a_n, b_s, b_n, lok, uid_s, uid_n, keep, cu_s, cu_n, cok)
+    del buf, a_s, a_n, b_s, b_n, uid_s, uid_n, cu_s, cu_n
+
     # --- People: number every user ID, then join linked ones
-    s, n, h, part = K.user_items(buf, a_s, a_n, b_s, b_n, lok, uid_s, uid_n, keep, cu_s, cu_n, cok)
     order, off = K.partition(part, K.GROUP_PARTS)
-    gidp, urep, _ = K.group(buf, s, n, h, order, off)
+    gidp, urep, _ = K.group(ubuf, s, n, h, order, off)
     ugid = K.ungroup(gidp, order, len(s))
     del gidp, order, off, h, part
-    person, name = K.people(ugid, lok, urep, s, n, buf)
+    person, name = K.people(ugid, lok, urep, s, n, ubuf)
     del urep
     log(f"people: {len(person)} user IDs")
 
@@ -215,7 +223,7 @@ def run(data, out):
         raise ValueError("window too long for the sort keys")
     ekey, epay, epart = K.event_keys(ugid, person, 2 * len(lok), keep, ts, typ, price, cat, ws, eshift, PERSON_PARTS)
     ckey, cpart = K.click_keys(ugid, person, 2 * len(lok) + len(keep), cok, cts, ws - K.WEEK, cshift, PERSON_PARTS)
-    del ugid, uid_s, uid_n, typ, price, cat, cu_s, cu_n, cts
+    del ugid, typ, price, cat, cts
     eorder, eoff = K.partition(epart, PERSON_PARTS)
     corder, coff = K.partition(cpart, PERSON_PARTS)
     del epart, cpart
@@ -225,7 +233,7 @@ def run(data, out):
     u_count = np.zeros(PERSON_PARTS, np.int64)
     cr_sess, cr_purch, cr_rev, assist = (np.zeros((PERSON_PARTS, ncamp + 1, ndays), np.int64) for _ in range(4))
     K.sessions(ekey, epay, eorder, eoff, eshift,
-               ckey, camp, cid_s, cid_n, buf, corder, coff, cshift,
+               ckey, camp, cid_s, cid_n, cid_buf, corder, coff, cshift,
                ws, len(categories), ncamp, day0,
                u_person, u_day, u_sess, u_events, u_rev, u_top, u_count,
                cr_sess, cr_purch, cr_rev, assist)
@@ -239,7 +247,7 @@ def run(data, out):
     who = name[u_person[sel]]
     top = u_top[sel]
     user_daily = pa.table({
-        "user_id": strings(buf, s[who], n[who]),
+        "user_id": strings(ubuf, s[who], n[who]),
         "day": pa.array(u_day[sel].astype(np.int32), type=pa.date32()),
         "sessions": u_sess[sel],
         "events": u_events[sel],

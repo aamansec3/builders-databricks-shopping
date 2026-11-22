@@ -311,14 +311,16 @@ def parse_links(buf, nl, header, lo, hi, a_s, a_n, b_s, b_n, ok):
 
 
 @nb.njit(cache=True, parallel=True)
-def parse_events(buf, nl, header, lo, hi, eid_s, eid_n, eid_h, uid_s, uid_n, pid_s, pid_n,
-                 ts, ingest, typ, price, ok):
+def parse_events(buf, nl, header, lo, hi, ptab, pbuf, ps, pn, pcat, unknown,
+                 eid_s, eid_n, eid_h, uid_s, uid_n, ts, ingest, typ, price, cat, ok):
     """Lines lo..hi of events. ok when well-formed with a non-empty event_id;
     the other field rules are checked on the kept copy, after dedup.
 
     Fields: 0 event_id, 1 user_id, 2 ts, 3 ingest_ts, 4 event_type, 5 product_id,
     6 price_cents. price is -1 unless the event is a purchase whose price is
-    digits only with at most 8 significant digits (range checked later).
+    digits only with at most 8 significant digits (range checked later). cat is
+    the product's category index (unknown when it isn't in products.csv), or -1
+    when product_id is empty; only the category is ever needed, not the ID.
     """
     n = hi - lo
     nch, size = _chunks(n)
@@ -344,8 +346,12 @@ def parse_events(buf, nl, header, lo, hi, eid_s, eid_n, eid_h, uid_s, uid_n, pid
             elif _is(buf, fb[8], fb[9], PURCHASE_W):
                 t = PURCHASE
             typ[j] = t
-            pid_s[j], pid_n[j] = fb[10], fb[11] - fb[10]
             price[j] = _digits(buf, fb[12], fb[13], 8) if t == PURCHASE else -1
+            if fb[11] == fb[10]:
+                cat[j] = -1
+            else:
+                k = _find(ptab, pbuf, ps, pn, buf, fb[10], fb[11] - fb[10])
+                cat[j] = pcat[k] if k >= 0 else unknown
 
 
 @nb.njit(cache=True, parallel=True)
@@ -383,7 +389,7 @@ def parse_clicks(buf, nl, header, lo, hi, ts_lo, ts_hi, ctab, cbuf, cs, cn,
 @nb.njit(cache=True, parallel=True)
 def hash_parts(h, use):
     """Hash partition of each row, or GROUP_PARTS (dropped) when not use."""
-    part = np.empty(len(h), np.int64)
+    part = np.empty(len(h), np.int16)
     for i in nb.prange(len(h)):
         part[i] = np.int64(h[i] >> np.uint64(64 - GROUP_BITS)) if use[i] else GROUP_PARTS
     return part
@@ -408,7 +414,7 @@ def partition(part, nparts):
             pos[c, p] = run
             run += hist[c, p]
     off[nparts + 1] = run
-    order = np.empty(n, np.int64)
+    order = np.empty(n, np.int32)  # row numbers stay under 2^31 even at 60M events
     for c in nb.prange(nch):
         for i in range(c * size, min(n, (c + 1) * size)):
             p = part[i]
@@ -429,14 +435,14 @@ def group(buf, s, n, h, order, off):
     (partition p's groups are goff[p]..goff[p+1]).
     """
     nparts = len(off) - 2
-    gidp = np.empty(off[nparts], np.int64)
+    gidp = np.empty(off[nparts], np.int32)
     goff = np.zeros(nparts + 1, np.int64)
     for p in nb.prange(nparts):
         lo = off[p]
         m = off[p + 1] - lo
         hl = np.empty(m, np.uint64)
         sl = np.empty(m, np.int64)
-        nl_ = np.empty(m, np.int64)
+        nl_ = np.empty(m, np.int32)
         for j in range(m):
             r = order[lo + j]
             hl[j], sl[j], nl_[j] = h[r], s[r], n[r]
@@ -446,7 +452,7 @@ def group(buf, s, n, h, order, off):
         tab = np.full(size, -1, np.int32)  # slot -> local group
         gh = np.empty(m, np.uint64)  # each local group's hash and string
         gs = np.empty(m, np.int64)
-        gn = np.empty(m, np.int64)
+        gn = np.empty(m, np.int32)
         mask = np.uint64(size - 1)
         k = 0
         for j in range(m):
@@ -480,7 +486,7 @@ def group(buf, s, n, h, order, off):
 @nb.njit(cache=True, parallel=True)
 def ungroup(gidp, order, n):
     """The group of each of n rows (-1 for dropped rows) from group's partition-order gidp."""
-    gid = np.full(n, -1, np.int64)
+    gid = np.full(n, -1, np.int32)
     for j in nb.prange(len(gidp)):
         gid[order[j]] = gidp[j]
     return gid
@@ -511,58 +517,96 @@ def earliest(gidp, order, off, goff, ingest, chosen):
 
 
 @nb.njit(cache=True, parallel=True)
-def validate(chosen, buf, uid_n, ts, ingest, typ, price, pid_s, pid_n, ts_lo, ts_hi,
-             ptab, pbuf, ps, pn, pcat, unknown, keep, cat):
-    """keep[r] for each chosen copy r that passes the field rules and isn't late,
-    and cat[r], its category index (unknown when the product isn't in products.csv).
-    Rows go in file order, so the arrays and the buffer are read front to back."""
+def validate(chosen, uid_n, ts, ingest, typ, price, cat, ts_lo, ts_hi, keep):
+    """keep[r] for each chosen copy r that passes the field rules and isn't late.
+    Rows go in file order, so the arrays are read front to back."""
     for r in nb.prange(len(chosen)):
         if not chosen[r]:
             continue
         t = ts[r]
-        if uid_n[r] == 0 or pid_n[r] == 0 or typ[r] == 0 or t < ts_lo or t >= ts_hi:
+        if uid_n[r] == 0 or cat[r] < 0 or typ[r] == 0 or t < ts_lo or t >= ts_hi:
             continue
         if typ[r] == PURCHASE and (price[r] < 1 or price[r] > 10_000_000):
             continue
         if ingest[r] == NULL or ingest[r] - t > DAY:
             continue
         keep[r] = True
-        k = _find(ptab, pbuf, ps, pn, buf, pid_s[r], pid_n[r])
-        cat[r] = pcat[k] if k >= 0 else unknown
 
 
 # --- People ------------------------------------------------------------------
 
 @nb.njit(cache=True, inline="always")
-def _item(buf, s0, n0, use, i, s, n, h, part):
-    s[i] = s0
-    n[i] = n0
+def _item(buf, s0, n0, use, i, n, h, part):
     if use:
         hv = _hash(buf, s0, n0)
-        h[i] = hv
+        n[i], h[i] = n0, hv
         part[i] = np.int64(hv >> np.uint64(64 - GROUP_BITS))
     else:
-        part[i] = GROUP_PARTS
+        n[i], part[i] = 0, GROUP_PARTS
+
+
+@nb.njit(cache=True, inline="always")
+def _copy(buf, s0, out, o, n0):
+    for t in range(n0):
+        out[o + t] = buf[s0 + t]
 
 
 @nb.njit(cache=True, parallel=True)
 def user_items(buf, a_s, a_n, b_s, b_n, lok, eu_s, eu_n, keep, cu_s, cu_n, cok):
     """Every user ID to number, as rows: both sides of each link (rows 2j, 2j+1),
-    then each kept event, then each valid click. Unused rows are dropped."""
+    then each kept event, then each valid click; unused rows are dropped.
+
+    The IDs are copied into a new, dense buffer, so the big input buffer can be
+    freed. Returns it, and each row's start in it, length, hash and partition.
+    """
     nl_, ne, nc = len(lok), len(keep), len(cok)
     m = 2 * nl_ + ne + nc
-    s = np.empty(m, np.int64)
-    n = np.empty(m, np.int64)
+    n = np.empty(m, np.int32)
     h = np.empty(m, np.uint64)
-    part = np.empty(m, np.int64)
+    part = np.empty(m, np.int16)
     for j in nb.prange(nl_):
-        _item(buf, a_s[j], a_n[j], lok[j], 2 * j, s, n, h, part)
-        _item(buf, b_s[j], b_n[j], lok[j], 2 * j + 1, s, n, h, part)
+        _item(buf, a_s[j], a_n[j], lok[j], 2 * j, n, h, part)
+        _item(buf, b_s[j], b_n[j], lok[j], 2 * j + 1, n, h, part)
     for j in nb.prange(ne):
-        _item(buf, eu_s[j], eu_n[j], keep[j], 2 * nl_ + j, s, n, h, part)
+        _item(buf, eu_s[j], eu_n[j], keep[j], 2 * nl_ + j, n, h, part)
     for j in nb.prange(nc):
-        _item(buf, cu_s[j], cu_n[j], cok[j], 2 * nl_ + ne + j, s, n, h, part)
-    return s, n, h, part
+        _item(buf, cu_s[j], cu_n[j], cok[j], 2 * nl_ + ne + j, n, h, part)
+    s = np.empty(m, np.int64)
+    run = 0
+    for i in range(m):
+        s[i] = run
+        run += n[i]
+    out = np.empty(max(run, 1), np.uint8)
+    for j in nb.prange(nl_):
+        _copy(buf, a_s[j], out, s[2 * j], n[2 * j])
+        _copy(buf, b_s[j], out, s[2 * j + 1], n[2 * j + 1])
+    for j in nb.prange(ne):
+        _copy(buf, eu_s[j], out, s[2 * nl_ + j], n[2 * nl_ + j])
+    for j in nb.prange(nc):
+        _copy(buf, cu_s[j], out, s[2 * nl_ + ne + j], n[2 * nl_ + ne + j])
+    return out, s, n, h, part
+
+
+@nb.njit(cache=True, parallel=True)
+def compact(buf, s, n, use):
+    """Copy the strings buf[s[i]:s[i]+n[i]] of the rows in use into a new, dense
+    buffer, so the big input buffer can be freed. Returns it and each row's new
+    start (meaningless for rows not in use)."""
+    m = len(s)
+    new_s = np.empty(m, np.int64)
+    run = 0
+    for i in range(m):
+        new_s[i] = run
+        if use[i]:
+            run += n[i]
+    out = np.empty(max(run, 1), np.uint8)
+    for i in nb.prange(m):
+        if use[i]:
+            o = new_s[i]
+            st = s[i]
+            for t in range(n[i]):
+                out[o + t] = buf[st + t]
+    return out, new_s
 
 
 @nb.njit(cache=True, inline="always")
@@ -607,13 +651,13 @@ def event_keys(gid, person, base, keep, ts, typ, price, cat, ts_lo, shift, npart
     m = len(keep)
     key = np.empty(m, np.int64)
     pay = np.empty(m, np.int64)
-    part = np.empty(m, np.int64)
+    part = np.empty(m, np.int16)
     for j in nb.prange(m):
         if keep[j]:
             p = person[gid[base + j]]
             key[j] = (p << shift) | (ts[j] - ts_lo)
             if typ[j] == PURCHASE:
-                pay[j] = (price[j] << 16) | (np.int64(cat[j]) << 1) | 1
+                pay[j] = (np.int64(price[j]) << 16) | (np.int64(cat[j]) << 1) | 1
             else:
                 pay[j] = np.int64(cat[j]) << 1
             part[j] = p % nparts
@@ -628,7 +672,7 @@ def click_keys(gid, person, base, ok, ts, ts_lo, shift, nparts):
     and the person's partition (nparts = dropped)."""
     m = len(ok)
     key = np.empty(m, np.int64)
-    part = np.empty(m, np.int64)
+    part = np.empty(m, np.int16)
     for j in nb.prange(m):
         if ok[j]:
             p = person[gid[base + j]]
